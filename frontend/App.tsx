@@ -196,16 +196,32 @@ export default function App() {
   const startTournament = () => socket.emit('host:start', { pin });
 
   const openScore = (m: Match) => { setSc1(m.score1 ?? 0); setSc2(m.score2 ?? 0); setScoring(m); };
-  const confirmScore = () => {
-    if (!scoring || sc1 === sc2) return;
-    socket.emit('host:setResult', { pin, matchId: scoring.id, score1: sc1, score2: sc2 });
-    setScoring(null);
-  };
+const confirmScore = () => {
+  if (!scoring || sc1 === sc2) return;
+
+  socket.emit('host:setResult', {
+    pin,
+    matchId: scoring.id,
+    score1: sc1,
+    score2: sc2,
+  });
+
+  setScoring(null);
+};
 
   const leave = () => {
-    setScreen('home'); setPin(''); setPlayers([]); setMatches([]);
-    setIsHost(false); setMyId(null); setChampion(null);
-  };
+  if (pin) {
+    socket.emit('player:leave');
+  }
+
+  setScreen('home');
+  setPin('');
+  setPlayers([]);
+  setMatches([]);
+  setIsHost(false);
+  setMyId(null);
+  setChampion(null);
+};
 
   /* Derivados */
   const isMe = (p?: Player | null) => !!p && !isHost && (p.id === myId || p.nickname === nickname.trim());
