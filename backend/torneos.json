@@ -142,6 +142,106 @@
     "champion": null,
     "createdAt": 1790878122796
   },
+  "481481": {
+    "pin": "481481",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "CLASIFICACION",
+    "players": [
+      {
+        "id": "ROYZM1djUmwp09ZSAAAL",
+        "nickname": "Luis",
+        "left": false
+      },
+      {
+        "id": "JP6mpMRXL7W14booAAAJ",
+        "nickname": "Alejandro",
+        "left": false
+      }
+    ],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm",
+      "Kimetsu no Yaiba"
+    ],
+    "matches": [
+      {
+        "id": "481481-1",
+        "stage": "clasificacion",
+        "round": 1,
+        "player1Id": "JP6mpMRXL7W14booAAAJ",
+        "player2Id": "ROYZM1djUmwp09ZSAAAL",
+        "score1": 0,
+        "score2": 0,
+        "winnerId": null,
+        "game": null,
+        "played": false,
+        "forfeit": false,
+        "playedAt": null
+      }
+    ],
+    "bannedNicknames": [],
+    "bannedPlayerIds": [],
+    "sequence": 1,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790881313015
+  },
+  "620649": {
+    "pin": "620649",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "LOBBY",
+    "players": [],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm",
+      "Kimetsu no Yaiba"
+    ],
+    "matches": [],
+    "bannedNicknames": [
+      "ale"
+    ],
+    "bannedPlayerIds": [
+      "UkDJ0Mge9BTopPcSAAAD"
+    ],
+    "sequence": 0,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790879413653
+  },
   "639319": {
     "pin": "639319",
     "hostSocketId": "lHjSu31ujRlfGbjUAAAN",
@@ -176,6 +276,105 @@
     "bracketRound": 0,
     "champion": null,
     "createdAt": 1790878871742
+  },
+  "671540": {
+    "pin": "671540",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "ELIMINATORIA",
+    "players": [
+      {
+        "id": "JP6mpMRXL7W14booAAAJ",
+        "nickname": "Alejandro",
+        "left": true
+      },
+      {
+        "id": "ROYZM1djUmwp09ZSAAAL",
+        "nickname": "Luis",
+        "left": true
+      }
+    ],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm"
+    ],
+    "matches": [
+      {
+        "id": "671540-1",
+        "stage": "clasificacion",
+        "round": 1,
+        "player1Id": "JP6mpMRXL7W14booAAAJ",
+        "player2Id": "ROYZM1djUmwp09ZSAAAL",
+        "score1": 0,
+        "score2": 2,
+        "winnerId": "ROYZM1djUmwp09ZSAAAL",
+        "game": "FIFA",
+        "played": true,
+        "forfeit": true,
+        "playedAt": 1790881279505
+      }
+    ],
+    "bannedNicknames": [
+      "alejandro"
+    ],
+    "bannedPlayerIds": [
+      "JP6mpMRXL7W14booAAAJ"
+    ],
+    "sequence": 1,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790880893627
+  },
+  "709354": {
+    "pin": "709354",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "LOBBY",
+    "players": [],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm",
+      "Kimetsu no Yaiba"
+    ],
+    "matches": [],
+    "bannedNicknames": [],
+    "bannedPlayerIds": [],
+    "sequence": 0,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790881302784
   },
   "802654": {
     "pin": "802654",
@@ -212,6 +411,41 @@
     "champion": null,
     "createdAt": 1790878962060
   },
+  "861516": {
+    "pin": "861516",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "LOBBY",
+    "players": [],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm",
+      "Kimetsu no Yaiba"
+    ],
+    "matches": [],
+    "bannedNicknames": [],
+    "bannedPlayerIds": [],
+    "sequence": 0,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790880519317
+  },
   "936785": {
     "pin": "936785",
     "hostSocketId": "lHjSu31ujRlfGbjUAAAN",
@@ -246,6 +480,41 @@
     "bracketRound": 0,
     "champion": null,
     "createdAt": 1790878854272
+  },
+  "987799": {
+    "pin": "987799",
+    "hostSocketId": "cIt8VFYCDwPzxfIbAAAB",
+    "status": "LOBBY",
+    "players": [],
+    "games": [
+      "FIFA",
+      "Minecraft",
+      "Brawl Stars",
+      "Clash Royale",
+      "UNO",
+      "Call of Duty",
+      "Rayman",
+      "Garfield Racing",
+      "Rocket League",
+      "Gang Beasts",
+      "Dragon Ball Sparking Zero",
+      "Asphalt Legends",
+      "Brawlhalla",
+      "Piedra Papel Tijeras",
+      "Tres en Raya",
+      "Pulso",
+      "PvP Fortnite",
+      "Jump Force",
+      "Naruto Storm",
+      "Kimetsu no Yaiba"
+    ],
+    "matches": [],
+    "bannedNicknames": [],
+    "bannedPlayerIds": [],
+    "sequence": 0,
+    "bracketRound": 0,
+    "champion": null,
+    "createdAt": 1790879812568
   },
   "994438": {
     "pin": "994438",

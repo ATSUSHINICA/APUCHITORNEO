@@ -1,10 +1,10 @@
 import {
   ConnectedSocket,
   MessageBody,
-  OnGatewayDisconnect,
   SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
+  OnGatewayDisconnect,
 } from '@nestjs/websockets';
 
 import { Server, Socket } from 'socket.io';
@@ -28,38 +28,47 @@ export class TournamentGateway
   ) {}
 
   // =========================================================
-  // HELPERS
+  // BROADCASTS
   // =========================================================
 
   private emitTournamentUpdate(
     pin: string,
   ): void {
     const snapshot =
-      this.tournamentService.getSnapshot(pin);
+      this.tournamentService.getSnapshot(
+        pin,
+      );
 
-    if (!snapshot) {
-      return;
-    }
+    if (!snapshot) return;
 
-    // Evento principal.
     this.server
       .to(pin)
-      .emit('tournament:updated', snapshot);
+      .emit(
+        'tournament:updated',
+        snapshot,
+      );
 
-    // Lo mantenemos para que tu App.tsx actual
-    // siga funcionando sin cambiar su apariencia.
     this.server
       .to(pin)
-      .emit('bracket:update', snapshot);
+      .emit(
+        'bracket:update',
+        snapshot,
+      );
 
-    // Si acaba el torneo, avisamos también.
-    if (snapshot.phase === 'FINISHED') {
+    if (
+      snapshot.phase ===
+      'FINISHED'
+    ) {
       this.server
         .to(pin)
-        .emit('tournament:end', {
-          champion: snapshot.champion,
-          snapshot,
-        });
+        .emit(
+          'tournament:end',
+          {
+            champion:
+              snapshot.champion,
+            snapshot,
+          },
+        );
     }
   }
 
@@ -67,40 +76,62 @@ export class TournamentGateway
     pin: string,
   ): void {
     const tournament =
-      this.tournamentService.getTournament(pin);
+      this.tournamentService.getTournament(
+        pin,
+      );
 
-    if (!tournament) {
-      return;
-    }
+    if (!tournament) return;
 
     this.server
       .to(pin)
       .emit(
         'lobby:update',
         tournament.players.filter(
-          (player) => !player.left,
+          (player) =>
+            !player.left,
         ),
       );
 
-    this.emitTournamentUpdate(pin);
+    this.emitTournamentUpdate(
+      pin,
+    );
+  }
+
+  private emitGamesUpdate(
+    pin: string,
+  ): void {
+    const tournament =
+      this.tournamentService.getTournament(
+        pin,
+      );
+
+    if (!tournament) return;
+
+    this.server
+      .to(pin)
+      .emit(
+        'games:update',
+        {
+          games:
+            tournament.games,
+        },
+      );
   }
 
   private emitPlayerState(
     pin: string,
   ): void {
     const tournament =
-      this.tournamentService.getTournament(pin);
+      this.tournamentService.getTournament(
+        pin,
+      );
 
-    if (!tournament) {
-      return;
-    }
+    if (!tournament) return;
 
     for (
       const player of tournament.players
     ) {
-      if (player.left) {
-        continue;
-      }
+      if (player.left) continue;
 
       const state =
         this.tournamentService.getPlayerHistory(
@@ -110,7 +141,10 @@ export class TournamentGateway
 
       this.server
         .to(player.id)
-        .emit('player:state', state);
+        .emit(
+          'player:state',
+          state,
+        );
     }
   }
 
@@ -119,40 +153,51 @@ export class TournamentGateway
     socketId: string,
   ): boolean {
     const tournament =
-      this.tournamentService.getTournament(pin);
+      this.tournamentService.getTournament(
+        pin,
+      );
 
-    return !!tournament &&
-      tournament.hostSocketId === socketId;
+    return !!(
+      tournament &&
+      tournament.hostSocketId ===
+        socketId
+    );
   }
 
   // =========================================================
-  // CREAR TORNEO
+  // CREAR
   // =========================================================
 
   @SubscribeMessage('host:create')
   handleCreateTournament(
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket()
+    client: Socket,
   ) {
     const tournament =
       this.tournamentService.createTournament(
         client.id,
       );
 
-    client.join(tournament.pin);
+    client.join(
+      tournament.pin,
+    );
 
     return {
       success: true,
 
-      pin: tournament.pin,
+      pin:
+        tournament.pin,
 
-      games: tournament.games,
+      games:
+        tournament.games,
 
-      phase: tournament.status,
+      phase:
+        tournament.status,
     };
   }
 
   // =========================================================
-  // UNIRSE AL TORNEO
+  // UNIRSE
   // =========================================================
 
   @SubscribeMessage('player:join')
@@ -166,7 +211,10 @@ export class TournamentGateway
     @ConnectedSocket()
     client: Socket,
   ) {
-    if (!data?.pin || !data?.nickname) {
+    if (
+      !data?.pin ||
+      !data?.nickname
+    ) {
       return {
         success: false,
         error:
@@ -179,7 +227,8 @@ export class TournamentGateway
         data.pin,
         {
           id: client.id,
-          nickname: data.nickname,
+          nickname:
+            data.nickname,
         },
       );
 
@@ -187,7 +236,9 @@ export class TournamentGateway
       return result;
     }
 
-    client.join(data.pin);
+    client.join(
+      data.pin,
+    );
 
     const tournament =
       this.tournamentService.getTournament(
@@ -202,15 +253,25 @@ export class TournamentGateway
       };
     }
 
-    // Actualizamos lobby.
     this.emitLobbyUpdate(
+      data.pin,
+    );
+
+    this.emitPlayerState(
       data.pin,
     );
 
     return {
       success: true,
 
-      pin: data.pin,
+      pin:
+        data.pin,
+
+      player:
+        result.player,
+
+      playerId:
+        client.id,
 
       players:
         tournament.players.filter(
@@ -218,14 +279,16 @@ export class TournamentGateway
             !player.left,
         ),
 
-      games: tournament.games,
+      games:
+        tournament.games,
 
-      phase: tournament.status,
+      phase:
+        tournament.status,
     };
   }
 
   // =========================================================
-  // INICIAR TORNEO
+  // START
   // =========================================================
 
   @SubscribeMessage('host:start')
@@ -246,7 +309,8 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
@@ -263,8 +327,14 @@ export class TournamentGateway
       };
     }
 
+    const activePlayers =
+      tournament.players.filter(
+        (player) =>
+          !player.left,
+      );
+
     if (
-      tournament.players.length < 2
+      activePlayers.length < 2
     ) {
       return {
         success: false,
@@ -274,7 +344,8 @@ export class TournamentGateway
     }
 
     if (
-      tournament.status !== 'LOBBY'
+      tournament.status !==
+      'LOBBY'
     ) {
       return {
         success: false,
@@ -293,16 +364,16 @@ export class TournamentGateway
         data.pin,
       );
 
-    // Evento que ya utiliza tu frontend.
     this.server
       .to(data.pin)
-      .emit('tournament:started', {
-        matches,
+      .emit(
+        'tournament:started',
+        {
+          matches,
+          snapshot,
+        },
+      );
 
-        snapshot,
-      });
-
-    // Evento adicional para mantener todo sincronizado.
     this.emitTournamentUpdate(
       data.pin,
     );
@@ -344,7 +415,8 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
@@ -376,10 +448,12 @@ export class TournamentGateway
   }
 
   // =========================================================
-  // REGISTRAR RESULTADO
+  // RESULTADO
   // =========================================================
 
-  @SubscribeMessage('host:setResult')
+  @SubscribeMessage(
+    'host:setResult',
+  )
   handleSetResult(
     @MessageBody()
     data: {
@@ -400,18 +474,11 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
-    /*
-     * IMPORTANTE:
-     *
-     * Ya NO necesitamos winnerId.
-     *
-     * El backend determina automáticamente
-     * el ganador mediante score1 y score2.
-     */
     const result =
       this.tournamentService.setMatchResult(
         data.pin,
@@ -424,17 +491,10 @@ export class TournamentGateway
       return result;
     }
 
-    /*
-     * Todos reciben el nuevo cuadro.
-     */
     this.emitTournamentUpdate(
       data.pin,
     );
 
-    /*
-     * Cada jugador recibe también
-     * su rival, juego e historial.
-     */
     this.emitPlayerState(
       data.pin,
     );
@@ -453,10 +513,12 @@ export class TournamentGateway
   }
 
   // =========================================================
-  // AÑADIR JUEGO
+  // JUEGOS
   // =========================================================
 
-  @SubscribeMessage('host:addGame')
+  @SubscribeMessage(
+    'host:addGame',
+  )
   handleAddGame(
     @MessageBody()
     data: {
@@ -475,7 +537,8 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
@@ -489,15 +552,9 @@ export class TournamentGateway
       return result;
     }
 
-    /*
-     * Actualizamos la lista de juegos
-     * de todos los participantes.
-     */
-    this.server
-      .to(data.pin)
-      .emit('games:update', {
-        games: result.games,
-      });
+    this.emitGamesUpdate(
+      data.pin,
+    );
 
     this.emitTournamentUpdate(
       data.pin,
@@ -506,11 +563,9 @@ export class TournamentGateway
     return result;
   }
 
-  // =========================================================
-  // ELIMINAR JUEGO
-  // =========================================================
-
-  @SubscribeMessage('host:removeGame')
+  @SubscribeMessage(
+    'host:removeGame',
+  )
   handleRemoveGame(
     @MessageBody()
     data: {
@@ -529,7 +584,8 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
@@ -543,13 +599,90 @@ export class TournamentGateway
       return result;
     }
 
-    this.server
-      .to(data.pin)
-      .emit('games:update', {
-        games: result.games,
-      });
+    this.emitGamesUpdate(
+      data.pin,
+    );
 
     this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    return result;
+  }
+
+  @SubscribeMessage(
+    'host:spinGame',
+  )
+  handleSpinGame(
+    @MessageBody()
+    data: {
+      pin: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error:
+          'No autorizado.',
+      };
+    }
+
+    return this.tournamentService.spinGame(
+      data.pin,
+    );
+  }
+
+  @SubscribeMessage(
+    'host:assignGame',
+  )
+  handleAssignGame(
+    @MessageBody()
+    data: {
+      pin: string;
+      matchId: string;
+      game: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error:
+          'No autorizado.',
+      };
+    }
+
+    const result =
+      this.tournamentService.assignGame(
+        data.pin,
+        data.matchId,
+        data.game,
+      );
+
+    if (!result.success) {
+      return result;
+    }
+
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    this.emitPlayerState(
       data.pin,
     );
 
@@ -560,7 +693,9 @@ export class TournamentGateway
   // EXPULSAR JUGADOR
   // =========================================================
 
-  @SubscribeMessage('host:kick')
+  @SubscribeMessage(
+    'host:kick',
+  )
   handleKickPlayer(
     @MessageBody()
     data: {
@@ -579,7 +714,8 @@ export class TournamentGateway
     ) {
       return {
         success: false,
-        error: 'No autorizado.',
+        error:
+          'No autorizado.',
       };
     }
 
@@ -593,19 +729,16 @@ export class TournamentGateway
       return result;
     }
 
-    /*
-     * Avisamos directamente al jugador expulsado.
-     */
     this.server
       .to(data.playerId)
-      .emit('player:kicked', {
-        message:
-          'Has sido expulsado del torneo.',
-      });
+      .emit(
+        'player:kicked',
+        {
+          message:
+            'Has sido expulsado del torneo.',
+        },
+      );
 
-    /*
-     * Lo sacamos de la sala Socket.IO.
-     */
     const kickedSocket =
       this.server.sockets.sockets.get(
         data.playerId,
@@ -621,6 +754,10 @@ export class TournamentGateway
       data.pin,
     );
 
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
     this.emitPlayerState(
       data.pin,
     );
@@ -628,15 +765,18 @@ export class TournamentGateway
     return {
       success: true,
 
-      player: result.player,
+      player:
+        result.player,
     };
   }
 
   // =========================================================
-  // SALIR VOLUNTARIAMENTE
+  // SALIR
   // =========================================================
 
-  @SubscribeMessage('player:leave')
+  @SubscribeMessage(
+    'player:leave',
+  )
   handlePlayerLeave(
     @MessageBody()
     data: {
@@ -663,6 +803,17 @@ export class TournamentGateway
       };
     }
 
+    if (
+      tournament.hostSocketId ===
+      client.id
+    ) {
+      return {
+        success: false,
+        error:
+          'El anfitrión no puede abandonar el torneo desde aquí.',
+      };
+    }
+
     const pin =
       tournament.pin;
 
@@ -678,9 +829,17 @@ export class TournamentGateway
       return result;
     }
 
-    this.emitLobbyUpdate(pin);
+    this.emitLobbyUpdate(
+      pin,
+    );
 
-    this.emitPlayerState(pin);
+    this.emitTournamentUpdate(
+      pin,
+    );
+
+    this.emitPlayerState(
+      pin,
+    );
 
     return {
       success: true,
@@ -688,7 +847,7 @@ export class TournamentGateway
   }
 
   // =========================================================
-  // DESCONEXIÓN AUTOMÁTICA
+  // DESCONECTAR
   // =========================================================
 
   handleDisconnect(
@@ -703,12 +862,7 @@ export class TournamentGateway
       return;
     }
 
-    /*
-     * Si era jugador, se elimina automáticamente.
-     *
-     * Si era el host, de momento no destruimos
-     * el torneo: queda guardado.
-     */
+    // El host NO se elimina automáticamente.
     if (
       tournament.hostSocketId ===
       client.id
@@ -729,13 +883,21 @@ export class TournamentGateway
       return;
     }
 
-    this.emitLobbyUpdate(pin);
+    this.emitLobbyUpdate(
+      pin,
+    );
 
-    this.emitPlayerState(pin);
+    this.emitTournamentUpdate(
+      pin,
+    );
+
+    this.emitPlayerState(
+      pin,
+    );
   }
 
   // =========================================================
-  // PEDIR ESTADO ACTUAL
+  // RECUPERAR ESTADO
   // =========================================================
 
   @SubscribeMessage(
@@ -763,19 +925,15 @@ export class TournamentGateway
       };
     }
 
-    client.join(data.pin);
+    client.join(
+      data.pin,
+    );
 
-    /*
-     * Estado general.
-     */
     client.emit(
       'tournament:updated',
       snapshot,
     );
 
-    /*
-     * Estado específico del jugador.
-     */
     const playerState =
       this.tournamentService.getPlayerHistory(
         data.pin,

@@ -1,14 +1,21 @@
 import { Injectable } from '@nestjs/common';
 import { randomBytes } from 'crypto';
-import { existsSync, readFileSync, writeFile } from 'fs';
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+} from 'fs';
 import { join } from 'path';
 
 import {
   BracketPlan,
   Match,
+  MatchStage,
   Player,
+  PlayerState,
   Standing,
   Tournament,
+  TournamentPhase,
   TournamentSnapshot,
 } from './tournament.interface';
 
@@ -37,9 +44,9 @@ const DEFAULT_GAMES = [
 
 @Injectable()
 export class TournamentService {
-  private tournaments = new Map<string, Tournament>();
+  private readonly filePath = join(process.cwd(), 'torneos.json');
 
-  private readonly dbFile = join(process.cwd(), 'torneos.json');
+  private tournaments: Record<string, Tournament> = {};
 
   constructor() {
     this.load();
@@ -51,39 +58,26 @@ export class TournamentService {
 
   private load(): void {
     try {
-      if (!existsSync(this.dbFile)) {
+      if (!existsSync(this.filePath)) {
+        this.tournaments = {};
         return;
       }
 
-      const data = readFileSync(this.dbFile, 'utf8');
+      const raw = readFileSync(this.filePath, 'utf8');
 
-      if (!data.trim()) {
-        return;
-      }
-
-      const tournaments = JSON.parse(data);
-
-      for (const [pin, tournament] of Object.entries(
-        tournaments as Record<string, Tournament>,
-      )) {
-        this.tournaments.set(pin, tournament);
-      }
-    } catch (error) {
-      console.error('No se pudieron cargar los torneos:', error);
+      this.tournaments = raw
+        ? JSON.parse(raw)
+        : {};
+    } catch {
+      this.tournaments = {};
     }
   }
 
   private save(): void {
-    const data = Object.fromEntries(this.tournaments);
-
-    writeFile(
-      this.dbFile,
-      JSON.stringify(data, null, 2),
-      (error) => {
-        if (error) {
-          console.error('No se pudieron guardar los torneos:', error);
-        }
-      },
+    writeFileSync(
+      this.filePath,
+      JSON.stringify(this.tournaments, null, 2),
+      'utf8',
     );
   }
 
@@ -91,17 +85,36 @@ export class TournamentService {
   // HELPERS
   // =========================================================
 
+  private generatePin(): string {
+    let pin = '';
+
+    do {
+      pin = String(
+        Math.floor(
+          100000 + Math.random() * 900000,
+        ),
+      );
+    } while (this.tournaments[pin]);
+
+    return pin;
+  }
+
   private generateId(): string {
-    return randomBytes(4).toString('hex');
+    return randomBytes(6).toString('hex');
   }
 
   private shuffle<T>(array: T[]): T[] {
     const result = [...array];
 
     for (let i = result.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = Math.floor(
+        Math.random() * (i + 1),
+      );
 
-      [result[i], result[j]] = [result[j], result[i]];
+      [result[i], result[j]] = [
+        result[j],
+        result[i],
+      ];
     }
 
     return result;
@@ -116,61 +129,41 @@ export class TournamentService {
     );
   }
 
-  private pickGame(tournament: Tournament): string | null {
-    if (tournament.games.length === 0) {
-      return null;
-    }
-
-    const index = Math.floor(
-      Math.random() * tournament.games.length,
+  private getActivePlayers(
+    tournament: Tournament,
+  ): Player[] {
+    return tournament.players.filter(
+      (player) => !player.left,
     );
-
-    return tournament.games[index];
   }
 
-  private roundName(size: number): string {
-    switch (size) {
-      case 2:
-        return 'Final';
+  private getMatch(
+    tournament: Tournament,
+    matchId: string,
+  ): Match | undefined {
+    return tournament.matches.find(
+      (match) => match.id === matchId,
+    );
+  }
 
-      case 4:
-        return 'Semifinal';
-
-      case 8:
-        return 'Cuartos';
-
-      case 16:
-        return 'Octavos';
-
-      case 32:
-        return 'Dieciseisavos';
-
-      default:
-        return `Ronda de ${size}`;
-    }
+  private getPlayerMatches(
+    tournament: Tournament,
+    playerId: string,
+  ): Match[] {
+    return tournament.matches.filter(
+      (match) =>
+        match.player1Id === playerId ||
+        match.player2Id === playerId,
+    );
   }
 
   // =========================================================
-  // PIN
+  // TORNEO
   // =========================================================
 
-  generatePin(): string {
-    let pin: string;
-
-    do {
-      pin = Math.floor(
-        100000 + Math.random() * 900000,
-      ).toString();
-    } while (this.tournaments.has(pin));
-
-    return pin;
-  }
-
-  // =========================================================
-  // CREAR TORNEO
-  // =========================================================
-
-  createTournament(hostSocketId: string): Tournament {
+  createTournament(
+    hostSocketId: string,
+  ): Tournament {
     const pin = this.generatePin();
 
     const tournament: Tournament = {
@@ -199,39 +192,29 @@ export class TournamentService {
       createdAt: Date.now(),
     };
 
-    this.tournaments.set(pin, tournament);
+    this.tournaments[pin] = tournament;
 
     this.save();
 
     return tournament;
   }
 
-  // =========================================================
-  // BUSCAR TORNEO
-  // =========================================================
-
-  getTournament(pin: string): Tournament | undefined {
-    return this.tournaments.get(pin);
+  getTournament(
+    pin: string,
+  ): Tournament | undefined {
+    return this.tournaments[pin];
   }
 
   findTournamentBySocket(
     socketId: string,
   ): Tournament | undefined {
-    for (const tournament of this.tournaments.values()) {
-      if (tournament.hostSocketId === socketId) {
-        return tournament;
-      }
-
-      const player = tournament.players.find(
-        (p) => p.id === socketId,
-      );
-
-      if (player) {
-        return tournament;
-      }
-    }
-
-    return undefined;
+    return Object.values(this.tournaments).find(
+      (tournament) =>
+        tournament.hostSocketId === socketId ||
+        tournament.players.some(
+          (player) => player.id === socketId,
+        ),
+    );
   }
 
   // =========================================================
@@ -240,12 +223,12 @@ export class TournamentService {
 
   addPlayer(
     pin: string,
-    player: Player,
-  ): {
-    success: boolean;
-    error?: string;
-  } {
-    const tournament = this.tournaments.get(pin);
+    data: {
+      id: string;
+      nickname: string;
+    },
+  ) {
+    const tournament = this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -261,81 +244,55 @@ export class TournamentService {
       };
     }
 
-    const nickname = player.nickname.trim();
+    const nickname = data.nickname.trim();
 
     if (!nickname) {
       return {
         success: false,
-        error: 'El apodo no puede estar vacío.',
+        error: 'Debes introducir un apodo.',
       };
     }
 
-    // No permitir volver a entrar a alguien expulsado.
+    const normalized = nickname.toLowerCase();
+
     if (
       tournament.bannedNicknames.includes(
-        nickname.toLowerCase(),
+        normalized,
       )
     ) {
       return {
         success: false,
-        error: 'Este jugador ha sido expulsado del torneo.',
+        error: 'Ese jugador ha sido expulsado del torneo.',
       };
     }
 
-    // Evitar dos jugadores con el mismo nickname.
-    const duplicate = tournament.players.some(
-      (existing) =>
-        existing.nickname.toLowerCase() ===
-        nickname.toLowerCase(),
+    const exists = tournament.players.some(
+      (player) =>
+        !player.left &&
+        player.nickname.toLowerCase() === normalized,
     );
 
-    if (duplicate) {
+    if (exists) {
       return {
         success: false,
-        error: 'Ese apodo ya está en uso.',
+        error: 'Ese apodo ya está ocupado.',
       };
     }
 
-    tournament.players.push({
-      id: player.id,
+    const player: Player = {
+      id: data.id,
       nickname,
       left: false,
-    });
+    };
+
+    tournament.players.push(player);
 
     this.save();
 
     return {
       success: true,
+      player,
     };
-  }
-
-  removePlayerFromLobby(
-    pin: string,
-    playerId: string,
-  ): boolean {
-    const tournament = this.tournaments.get(pin);
-
-    if (!tournament) {
-      return false;
-    }
-
-    if (tournament.status !== 'LOBBY') {
-      return false;
-    }
-
-    const index = tournament.players.findIndex(
-      (player) => player.id === playerId,
-    );
-
-    if (index === -1) {
-      return false;
-    }
-
-    tournament.players.splice(index, 1);
-
-    this.save();
-
-    return true;
   }
 
   // =========================================================
@@ -345,12 +302,8 @@ export class TournamentService {
   addGame(
     pin: string,
     game: string,
-  ): {
-    success: boolean;
-    error?: string;
-    games?: string[];
-  } {
-    const tournament = this.tournaments.get(pin);
+  ) {
+    const tournament = this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -359,25 +312,25 @@ export class TournamentService {
       };
     }
 
-    const cleanGame = game.trim().slice(0, 40);
+    const cleanGame = game?.trim();
 
     if (!cleanGame) {
       return {
         success: false,
-        error: 'Escribe el nombre del juego.',
+        error: 'El nombre del juego está vacío.',
       };
     }
 
     const exists = tournament.games.some(
-      (existing) =>
-        existing.toLowerCase() ===
+      (item) =>
+        item.toLowerCase() ===
         cleanGame.toLowerCase(),
     );
 
     if (exists) {
       return {
         success: false,
-        error: 'Ese juego ya está en la lista.',
+        error: 'Ese juego ya existe.',
       };
     }
 
@@ -394,12 +347,8 @@ export class TournamentService {
   removeGame(
     pin: string,
     game: string,
-  ): {
-    success: boolean;
-    error?: string;
-    games?: string[];
-  } {
-    const tournament = this.tournaments.get(pin);
+  ) {
+    const tournament = this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -408,9 +357,18 @@ export class TournamentService {
       };
     }
 
-    tournament.games = tournament.games.filter(
-      (existing) => existing !== game,
+    const index = tournament.games.findIndex(
+      (item) => item === game,
     );
+
+    if (index === -1) {
+      return {
+        success: false,
+        error: 'Juego no encontrado.',
+      };
+    }
+
+    tournament.games.splice(index, 1);
 
     this.save();
 
@@ -420,11 +378,94 @@ export class TournamentService {
     };
   }
 
+  spinGame(pin: string) {
+    const tournament = this.getTournament(pin);
+
+    if (!tournament) {
+      return {
+        success: false,
+        error: 'Torneo no encontrado.',
+      };
+    }
+
+    if (tournament.games.length === 0) {
+      return {
+        success: false,
+        error: 'No hay juegos disponibles.',
+      };
+    }
+
+    const game =
+      tournament.games[
+        Math.floor(
+          Math.random() *
+            tournament.games.length,
+        )
+      ];
+
+    return {
+      success: true,
+      game,
+    };
+  }
+
+  assignGame(
+    pin: string,
+    matchId: string,
+    game: string,
+  ) {
+    const tournament = this.getTournament(pin);
+
+    if (!tournament) {
+      return {
+        success: false,
+        error: 'Torneo no encontrado.',
+      };
+    }
+
+    const match = this.getMatch(
+      tournament,
+      matchId,
+    );
+
+    if (!match) {
+      return {
+        success: false,
+        error: 'Partido no encontrado.',
+      };
+    }
+
+    if (match.played) {
+      return {
+        success: false,
+        error: 'El partido ya ha terminado.',
+      };
+    }
+
+    if (!tournament.games.includes(game)) {
+      return {
+        success: false,
+        error: 'Ese juego no está disponible.',
+      };
+    }
+
+    match.game = game;
+
+    this.save();
+
+    return {
+      success: true,
+      match,
+    };
+  }
+
   // =========================================================
-  // PLAN DE CLASIFICACIÓN
+  // PLAN DE TORNEO
   // =========================================================
 
-  getBracketPlan(n: number): BracketPlan {
+  getBracketPlan(
+    n: number,
+  ): BracketPlan {
     if (n < 2) {
       return {
         bracketSize: 0,
@@ -432,52 +473,94 @@ export class TournamentService {
         repSlots: 0,
         repPlayers: 0,
         out: n,
+        totalNeeded: 0,
       };
     }
 
     let bracketSize = 2;
 
-    while (bracketSize * 2 <= n) {
+    while (
+      bracketSize * 2 <= n
+    ) {
       bracketSize *= 2;
     }
 
-    let direct = Math.ceil(bracketSize / 2);
+    let direct = Math.ceil(
+      bracketSize / 2,
+    );
 
-    let repSlots = bracketSize - direct;
+    let repSlots =
+      bracketSize - direct;
 
-    let repPlayers = repSlots * 2;
+    let repPlayers =
+      repSlots * 2;
 
-    let total = direct + repPlayers;
+    let totalNeeded =
+      direct + repPlayers;
 
-    while (total > n && bracketSize > 2) {
+    while (
+      totalNeeded > n &&
+      bracketSize > 2
+    ) {
       bracketSize /= 2;
 
-      direct = Math.ceil(bracketSize / 2);
+      direct = Math.ceil(
+        bracketSize / 2,
+      );
 
-      repSlots = bracketSize - direct;
+      repSlots =
+        bracketSize - direct;
 
-      repPlayers = repSlots * 2;
+      repPlayers =
+        repSlots * 2;
 
-      total = direct + repPlayers;
+      totalNeeded =
+        direct + repPlayers;
     }
 
-    if (total > n) {
+    if (totalNeeded > n) {
       repSlots = 0;
-
       repPlayers = 0;
 
-      direct = Math.min(bracketSize, n);
+      direct = Math.min(
+        bracketSize,
+        n,
+      );
 
-      total = direct;
+      totalNeeded = direct;
     }
+
+    const out = Math.max(
+      0,
+      n - totalNeeded,
+    );
 
     return {
       bracketSize,
       direct,
       repSlots,
       repPlayers,
-      out: Math.max(0, n - total),
+      out,
+      totalNeeded,
     };
+  }
+
+  private roundName(
+    size: number,
+  ): string {
+    if (size === 2) return 'GRAN FINAL';
+
+    if (size === 4) return 'SEMIFINAL';
+
+    if (size === 8) return 'CUARTOS DE FINAL';
+
+    if (size === 16) return 'OCTAVOS DE FINAL';
+
+    if (size === 32) {
+      return 'DIECISEISAVOS DE FINAL';
+    }
+
+    return `RONDA DE ${size}`;
   }
 
   // =========================================================
@@ -486,43 +569,64 @@ export class TournamentService {
 
   private createMatch(
     tournament: Tournament,
-    stage: Match['stage'],
+    stage: MatchStage,
     round: number,
-    label: string,
     player1Id: string,
     player2Id: string,
   ): Match {
-    const player1 =
-      this.getPlayer(tournament, player1Id) ?? null;
-
-    const player2 =
-      this.getPlayer(tournament, player2Id) ?? null;
-
     const match: Match = {
-      id: `m${++tournament.sequence}`,
+      id: `${tournament.pin}-${++tournament.sequence}`,
 
       stage,
 
       round,
 
-      label,
+      player1Id,
 
-      player1,
+      player2Id,
 
-      player2,
+      score1: 0,
 
-      score1: null,
+      score2: 0,
 
-      score2: null,
+      winnerId: null,
 
-      winner: null,
+      game: null,
 
-      game: this.pickGame(tournament),
+      played: false,
+
+      forfeit: false,
+
+      playedAt: null,
+
+      roundName:
+        stage === 'eliminatoria'
+          ? this.roundName(
+              this.getExpectedRoundSize(
+                tournament,
+                round,
+              ),
+            )
+          : undefined,
     };
 
     tournament.matches.push(match);
 
     return match;
+  }
+
+  private getExpectedRoundSize(
+    tournament: Tournament,
+    round: number,
+  ): number {
+    const eliminationMatches =
+      tournament.matches.filter(
+        (match) =>
+          match.stage === 'eliminatoria' &&
+          match.round === round,
+      );
+
+    return eliminationMatches.length * 2;
   }
 
   // =========================================================
@@ -540,96 +644,90 @@ export class TournamentService {
 
     tournament.champion = null;
 
-    const ids = this.shuffle(
-      tournament.players
-        .filter((player) => !player.left)
-        .map((player) => player.id),
-    );
+    tournament.status =
+      'CLASIFICACION';
 
-    if (ids.length < 2) {
+    const players =
+      this.shuffle(
+        this.getActivePlayers(tournament),
+      );
+
+    if (players.length < 2) {
+      this.save();
+
       return [];
     }
 
-    /*
-     * Método del círculo / round-robin.
-     *
-     * Cada jugador se enfrenta a rivales diferentes
-     * siempre que el número de jugadores lo permita.
-     */
-    const list: Array<string | null> = [...ids];
+    let list = [...players];
 
     if (list.length % 2 !== 0) {
-      list.push(null);
+      list.push(null as any);
     }
 
-    const n = list.length;
+    const rounds: Match[][] = [];
 
-    const fixed = list[0];
-
-    const rotation = list.slice(1);
-
-    const rounds: Array<
-      Array<[string, string]>
-    > = [];
+    const totalRounds =
+      Math.min(
+        3,
+        list.length - 1,
+      );
 
     for (
       let round = 0;
-      round < n - 1;
+      round < totalRounds;
       round++
     ) {
-      const current = [
-        fixed,
-        ...rotation,
-      ];
-
-      const pairs: Array<
-        [string, string]
-      > = [];
+      const roundMatches: Match[] = [];
 
       for (
         let i = 0;
-        i < n / 2;
+        i < list.length / 2;
         i++
       ) {
-        const a = current[i];
+        const player1 =
+          list[i];
 
-        const b = current[n - 1 - i];
+        const player2 =
+          list[
+            list.length - 1 - i
+          ];
 
-        if (a && b) {
-          pairs.push([a, b]);
+        if (
+          player1 &&
+          player2
+        ) {
+          const match =
+            this.createMatch(
+              tournament,
+              'clasificacion',
+              round + 1,
+              player1.id,
+              player2.id,
+            );
+
+          roundMatches.push(match);
         }
       }
 
-      rounds.push(pairs);
+      rounds.push(roundMatches);
 
-      rotation.unshift(
-        rotation.pop()!,
+      const fixed = list[0];
+
+      const rest = list.slice(1);
+
+      rest.unshift(
+        rest.pop()!,
       );
+
+      list = [
+        fixed,
+        ...rest,
+      ];
     }
-
-    /*
-     * El ejemplo utiliza 3 jornadas.
-     */
-    rounds
-      .slice(0, 3)
-      .forEach((pairs, index) => {
-        for (const [player1, player2] of pairs) {
-          this.createMatch(
-            tournament,
-            'clasificacion',
-            index + 1,
-            `Jornada ${index + 1}`,
-            player1,
-            player2,
-          );
-        }
-      });
-
-    tournament.status = 'CLASIFICACION';
 
     this.save();
 
-    return tournament.matches;
+    return rounds.flat();
   }
 
   // =========================================================
@@ -639,148 +737,157 @@ export class TournamentService {
   getStandings(
     tournament: Tournament,
   ): Standing[] {
-    const rows: Array<{
-      id: string;
-      idx: number;
-      played: number;
-      wins: number;
-      diff: number;
-      zone: 'directo' | 'repesca' | 'fuera';
-      left: boolean;
-    }> = [];
+    const players =
+      this.getActivePlayers(
+        tournament,
+      );
 
-    tournament.players.forEach(
-      (player, index) => {
-        const matches =
-          tournament.matches.filter(
-            (match) =>
-              match.stage === 'clasificacion' &&
-              match.winner !== null &&
-              (
-                match.player1?.id === player.id ||
-                match.player2?.id === player.id
-              ),
-          );
+    const plan =
+      this.getBracketPlan(
+        players.length,
+      );
 
-        let wins = 0;
+    const standings =
+      players.map(
+        (player, index) => {
+          const matches =
+            tournament.matches.filter(
+              (match) =>
+                match.stage ===
+                  'clasificacion' &&
+                match.played &&
+                (
+                  match.player1Id ===
+                    player.id ||
+                  match.player2Id ===
+                    player.id
+                ),
+            );
 
-        let diff = 0;
+          let wins = 0;
+          let losses = 0;
+          let scoreFor = 0;
+          let scoreAgainst = 0;
 
-        for (const match of matches) {
-          if (match.winner?.id === player.id) {
-            wins++;
-          }
-
-          if (
-            match.score1 !== null &&
-            match.score2 !== null
+          for (
+            const match of matches
           ) {
+            const isPlayer1 =
+              match.player1Id ===
+              player.id;
+
+            const ownScore =
+              isPlayer1
+                ? match.score1
+                : match.score2;
+
+            const opponentScore =
+              isPlayer1
+                ? match.score2
+                : match.score1;
+
+            scoreFor += ownScore;
+
+            scoreAgainst +=
+              opponentScore;
+
             if (
-              match.player1?.id === player.id
+              match.winnerId ===
+              player.id
             ) {
-              diff +=
-                match.score1 -
-                match.score2;
+              wins++;
             } else {
-              diff +=
-                match.score2 -
-                match.score1;
+              losses++;
             }
           }
+
+          return {
+            position: 0,
+
+            player,
+
+            played:
+              matches.length,
+
+            wins,
+
+            losses,
+
+            scoreFor,
+
+            scoreAgainst,
+
+            roundDifference:
+              scoreFor -
+              scoreAgainst,
+
+            zone: 'fuera' as const,
+
+            originalIndex: index,
+          };
+        },
+      );
+
+    standings.sort(
+      (a: any, b: any) => {
+        if (b.wins !== a.wins) {
+          return b.wins - a.wins;
         }
 
-        rows.push({
-          id: player.id,
-          idx: index,
-          played: matches.length,
-          wins,
-          diff,
-          zone: 'fuera',
-          left: !!player.left,
-        });
+        if (
+          b.roundDifference !==
+          a.roundDifference
+        ) {
+          return (
+            b.roundDifference -
+            a.roundDifference
+          );
+        }
+
+        if (
+          b.scoreFor !==
+          a.scoreFor
+        ) {
+          return (
+            b.scoreFor -
+            a.scoreFor
+          );
+        }
+
+        return (
+          a.originalIndex -
+          b.originalIndex
+        );
       },
     );
 
-    /*
-     * Desempate:
-     *
-     * 1. Victorias
-     * 2. Enfrentamiento directo
-     * 3. Diferencia de marcador
-     * 4. Orden original
-     */
-    const headToHead = (
-      a: string,
-      b: string,
-    ): number => {
-      const match =
-        tournament.matches.find(
-          (m) =>
-            m.stage === 'clasificacion' &&
-            m.winner !== null &&
-            (
-              (
-                m.player1?.id === a &&
-                m.player2?.id === b
-              ) ||
-              (
-                m.player1?.id === b &&
-                m.player2?.id === a
-              )
-            ),
-        );
+    standings.forEach(
+      (standing: any, index) => {
+        standing.position =
+          index + 1;
 
-      if (!match || !match.winner) {
-        return 0;
-      }
+        if (
+          index < plan.direct
+        ) {
+          standing.zone =
+            'directo';
+        } else if (
+          index <
+          plan.direct +
+            plan.repPlayers
+        ) {
+          standing.zone =
+            'repesca';
+        } else {
+          standing.zone =
+            'fuera';
+        }
 
-      if (match.winner.id === a) {
-        return -1;
-      }
-
-      return 1;
-    };
-
-    rows.sort(
-      (a, b) =>
-        b.wins - a.wins ||
-        headToHead(a.id, b.id) ||
-        b.diff - a.diff ||
-        a.idx - b.idx,
+        delete standing.originalIndex;
+      },
     );
 
-    const plan =
-      this.getBracketPlan(rows.length);
-
-    rows.forEach((row, index) => {
-      if (index < plan.direct) {
-        row.zone = 'directo';
-      } else if (
-        index <
-        plan.direct + plan.repPlayers
-      ) {
-        row.zone = 'repesca';
-      } else {
-        row.zone = 'fuera';
-      }
-    });
-
-    return rows.map((row) => {
-      const player =
-        this.getPlayer(
-          tournament,
-          row.id,
-        )!;
-
-      return {
-        player,
-        played: row.played,
-        wins: row.wins,
-        diff: row.diff,
-        zone: row.zone,
-        left: row.left,
-      };
-    });
+    return standings;
   }
 
   // =========================================================
@@ -789,17 +896,9 @@ export class TournamentService {
 
   lockClassification(
     pin: string,
-  ):
-    | {
-        success: true;
-        tournament: Tournament;
-      }
-    | {
-        success: false;
-        error: string;
-      } {
+  ) {
     const tournament =
-      this.tournaments.get(pin);
+      this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -815,169 +914,176 @@ export class TournamentService {
       return {
         success: false,
         error:
-          'La clasificación no está activa.',
+          'La clasificación ya está cerrada.',
       };
     }
 
-    const pending =
-      tournament.matches.some(
+    const classificationMatches =
+      tournament.matches.filter(
         (match) =>
           match.stage ===
-            'clasificacion' &&
-          !match.winner,
+          'clasificacion',
       );
 
-    if (pending) {
+    const unfinished =
+      classificationMatches.some(
+        (match) => !match.played,
+      );
+
+    if (unfinished) {
       return {
         success: false,
         error:
-          'Aún quedan partidos de clasificación sin resultado.',
+          'Todavía quedan partidos de clasificación sin resultado.',
       };
     }
 
     const standings =
-      this.getStandings(tournament);
+      this.getStandings(
+        tournament,
+      );
 
     const plan =
       this.getBracketPlan(
-        tournament.players.length,
+        standings.length,
       );
 
     const direct =
-      standings
-        .filter(
-          (row) =>
-            row.zone === 'directo',
-        )
-        .map(
-          (row) => row.player.id,
-        );
+      standings.slice(
+        0,
+        plan.direct,
+      );
 
     const repechagePlayers =
-      standings
-        .filter(
-          (row) =>
-            row.zone === 'repesca',
-        )
-        .map(
-          (row) => row.player.id,
-        );
+      standings.slice(
+        plan.direct,
+        plan.direct +
+          plan.repPlayers,
+      );
 
-    /*
-     * Si no hay repesca, comenzamos directamente
-     * la llave.
-     */
+    tournament.matches =
+      tournament.matches.filter(
+        (match) =>
+          match.stage !==
+          'repesca',
+      );
+
     if (
-      plan.repSlots === 0
+      repechagePlayers.length === 0
     ) {
       tournament.status =
         'ELIMINATORIA';
 
       this.startEliminationRound(
         tournament,
-        direct,
+        direct.map(
+          (standing) =>
+            standing.player.id,
+        ),
       );
+    } else {
+      tournament.status =
+        'REPESCA';
 
-      this.save();
+      for (
+        let i = 0;
+        i <
+        repechagePlayers.length;
+        i += 2
+      ) {
+        const player1 =
+          repechagePlayers[i];
 
-      return {
-        success: true,
-        tournament,
-      };
-    }
+        const player2 =
+          repechagePlayers[i + 1];
 
-    /*
-     * Creamos la repesca.
-     *
-     * Ejemplo:
-     *
-     * 3º vs 6º
-     * 4º vs 5º
-     */
-    tournament.status =
-      'REPESCA';
+        if (
+          !player1 ||
+          !player2
+        ) {
+          continue;
+        }
 
-    const ordered =
-      [...repechagePlayers];
-
-    for (
-      let i = 0;
-      i < ordered.length / 2;
-      i++
-    ) {
-      const player1 =
-        ordered[i];
-
-      const player2 =
-        ordered[
-          ordered.length - 1 - i
-        ];
-
-      this.createMatch(
-        tournament,
-        'repesca',
-        1,
-        `Repesca ${i + 1}`,
-        player1,
-        player2,
-      );
+        this.createMatch(
+          tournament,
+          'repesca',
+          1,
+          player1.player.id,
+          player2.player.id,
+        );
+      }
     }
 
     this.save();
 
     return {
       success: true,
-      tournament,
+
+      snapshot:
+        this.getSnapshot(pin),
     };
   }
 
   // =========================================================
-  // REPESCA -> ELIMINATORIA
+  // REPESCA
   // =========================================================
 
   private tryStartElimination(
     tournament: Tournament,
   ): void {
-    const repechage =
+    const repechageMatches =
       tournament.matches.filter(
         (match) =>
-          match.stage === 'repesca',
+          match.stage ===
+          'repesca',
       );
 
-    if (repechage.length === 0) {
+    if (
+      repechageMatches.length === 0
+    ) {
       return;
     }
 
     if (
-      repechage.some(
+      repechageMatches.some(
         (match) =>
-          !match.winner,
+          !match.played,
       )
     ) {
       return;
     }
 
     const standings =
-      this.getStandings(tournament);
+      this.getStandings(
+        tournament,
+      );
+
+    const plan =
+      this.getBracketPlan(
+        standings.length,
+      );
 
     const direct =
       standings
-        .filter(
-          (row) =>
-            row.zone === 'directo',
+        .slice(
+          0,
+          plan.direct,
         )
         .map(
-          (row) => row.player.id,
+          (standing) =>
+            standing.player.id,
         );
 
     const repechageWinners =
-      repechage
+      repechageMatches
         .map(
           (match) =>
-            match.winner?.id,
+            match.winnerId,
         )
         .filter(
-          (id): id is string =>
+          (
+            id,
+          ): id is string =>
             !!id,
         );
 
@@ -988,19 +1094,19 @@ export class TournamentService {
       i < direct.length;
       i++
     ) {
-      order.push(direct[i]);
+      order.push(
+        direct[i],
+      );
 
-      const repechageWinner =
+      const winner =
         repechageWinners[
           repechageWinners.length -
             1 -
             i
         ];
 
-      if (repechageWinner) {
-        order.push(
-          repechageWinner,
-        );
+      if (winner) {
+        order.push(winner);
       }
     }
 
@@ -1014,7 +1120,7 @@ export class TournamentService {
   }
 
   // =========================================================
-  // ELIMINATORIAS
+  // ELIMINATORIA
   // =========================================================
 
   private startEliminationRound(
@@ -1024,10 +1130,7 @@ export class TournamentService {
     if (playerIds.length < 2) {
       if (playerIds.length === 1) {
         tournament.champion =
-          this.getPlayer(
-            tournament,
-            playerIds[0],
-          ) ?? null;
+          playerIds[0];
 
         tournament.status =
           'FINISHED';
@@ -1038,14 +1141,16 @@ export class TournamentService {
 
     tournament.bracketRound++;
 
-    const label =
-      this.roundName(
-        playerIds.length,
-      );
+    const round =
+      tournament.bracketRound;
+
+    const bracketSize =
+      playerIds.length;
 
     for (
       let i = 0;
-      i < playerIds.length;
+      i <
+      playerIds.length;
       i += 2
     ) {
       const player1 =
@@ -1054,18 +1159,26 @@ export class TournamentService {
       const player2 =
         playerIds[i + 1];
 
-      if (!player1 || !player2) {
+      if (
+        !player1 ||
+        !player2
+      ) {
         continue;
       }
 
-      this.createMatch(
-        tournament,
-        'eliminatoria',
-        tournament.bracketRound,
-        label,
-        player1,
-        player2,
-      );
+      const match =
+        this.createMatch(
+          tournament,
+          'eliminatoria',
+          round,
+          player1,
+          player2,
+        );
+
+      match.roundName =
+        this.roundName(
+          bracketSize,
+        );
     }
   }
 
@@ -1073,47 +1186,55 @@ export class TournamentService {
     tournament: Tournament,
   ): void {
     const currentRound =
+      tournament.bracketRound;
+
+    const matches =
       tournament.matches.filter(
         (match) =>
           match.stage ===
             'eliminatoria' &&
           match.round ===
-            tournament.bracketRound,
+            currentRound,
       );
 
-    if (currentRound.length === 0) {
+    if (
+      matches.length === 0
+    ) {
       return;
     }
 
     if (
-      currentRound.some(
+      matches.some(
         (match) =>
-          !match.winner,
+          !match.played,
       )
     ) {
       return;
     }
 
     const winners =
-      currentRound
+      matches
         .map(
           (match) =>
-            match.winner?.id,
+            match.winnerId,
         )
         .filter(
-          (id): id is string =>
+          (
+            id,
+          ): id is string =>
             !!id,
         );
 
-    if (winners.length === 1) {
+    if (
+      winners.length === 1
+    ) {
       tournament.champion =
-        this.getPlayer(
-          tournament,
-          winners[0],
-        ) ?? null;
+        winners[0];
 
       tournament.status =
         'FINISHED';
+
+      this.save();
 
       return;
     }
@@ -1125,7 +1246,7 @@ export class TournamentService {
   }
 
   // =========================================================
-  // RESULTADO DE PARTIDO
+  // RESULTADOS
   // =========================================================
 
   setMatchResult(
@@ -1133,18 +1254,9 @@ export class TournamentService {
     matchId: string,
     score1: number,
     score2: number,
-  ):
-    | {
-        success: true;
-        tournament: Tournament;
-        isFinished: boolean;
-      }
-    | {
-        success: false;
-        error: string;
-      } {
+  ) {
     const tournament =
-      this.tournaments.get(pin);
+      this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -1154,9 +1266,9 @@ export class TournamentService {
     }
 
     const match =
-      tournament.matches.find(
-        (item) =>
-          item.id === matchId,
+      this.getMatch(
+        tournament,
+        matchId,
       );
 
     if (!match) {
@@ -1166,16 +1278,34 @@ export class TournamentService {
       };
     }
 
+    if (match.played) {
+      return {
+        success: false,
+        error:
+          'Este partido ya ha terminado.',
+      };
+    }
+
+    if (!match.game) {
+      return {
+        success: false,
+        error:
+          'Primero debes asignar un juego al partido.',
+      };
+    }
+
     if (
       !Number.isInteger(score1) ||
       !Number.isInteger(score2) ||
       score1 < 0 ||
-      score2 < 0
+      score2 < 0 ||
+      score1 > 2 ||
+      score2 > 2
     ) {
       return {
         success: false,
         error:
-          'El marcador no es válido.',
+          'El marcador debe estar entre 0 y 2.',
       };
     }
 
@@ -1187,49 +1317,38 @@ export class TournamentService {
       };
     }
 
-    if (match.winner) {
-      return {
-        success: false,
-        error:
-          'Este partido ya tiene resultado.',
-      };
-    }
-
     if (
-      !match.player1 ||
-      !match.player2
+      score1 !== 2 &&
+      score2 !== 2
     ) {
       return {
         success: false,
         error:
-          'El partido no tiene dos jugadores.',
+          'Un jugador debe llegar a 2.',
       };
     }
 
-    match.score1 = score1;
+    match.score1 =
+      score1;
 
-    match.score2 = score2;
+    match.score2 =
+      score2;
 
-    match.winner =
+    match.winnerId =
       score1 > score2
-        ? match.player1
-        : match.player2;
+        ? match.player1Id
+        : match.player2Id;
+
+    match.played = true;
 
     match.forfeit = false;
 
-    match.playedAt = Date.now();
+    match.playedAt =
+      Date.now();
 
-    /*
-     * Guardamos el resultado inmediatamente.
-     */
-    this.save();
-
-    /*
-     * Avanzamos automáticamente
-     * cuando corresponde.
-     */
     if (
-      match.stage === 'repesca'
+      match.stage ===
+      'repesca'
     ) {
       this.tryStartElimination(
         tournament,
@@ -1249,26 +1368,26 @@ export class TournamentService {
 
     return {
       success: true,
-      tournament,
+
       isFinished:
         tournament.status ===
         'FINISHED',
+
+      snapshot:
+        this.getSnapshot(pin),
     };
   }
 
   // =========================================================
-  // ABANDONAR / EXPULSAR
+  // EXPULSAR / SALIR
   // =========================================================
 
   removePlayer(
     pin: string,
     playerId: string,
-  ): {
-    success: boolean;
-    error?: string;
-  } {
+  ) {
     const tournament =
-      this.tournaments.get(pin);
+      this.getTournament(pin);
 
     if (!tournament) {
       return {
@@ -1286,189 +1405,27 @@ export class TournamentService {
     if (!player) {
       return {
         success: false,
-        error: 'Jugador no encontrado.',
+        error:
+          'Jugador no encontrado.',
       };
     }
 
-    /*
-     * En lobby desaparece completamente.
-     */
     if (
-      tournament.status === 'LOBBY'
+      tournament.status ===
+      'LOBBY'
     ) {
       tournament.players =
         tournament.players.filter(
           (item) =>
             item.id !== playerId,
         );
+    } else {
+      player.left = true;
 
-      this.save();
-
-      return {
-        success: true,
-      };
-    }
-
-    /*
-     * Una vez iniciado el torneo,
-     * marcamos al jugador como abandonado.
-     */
-    player.left = true;
-
-    this.resolveForfeitMatches(
-      tournament,
-      playerId,
-    );
-
-    this.save();
-
-    return {
-      success: true,
-    };
-  }
-
-  private resolveForfeitMatches(
-    tournament: Tournament,
-    playerId: string,
-  ): void {
-    for (const match of tournament.matches) {
-      if (match.winner) {
-        continue;
-      }
-
-      const player1Left =
-        match.player1?.id ===
-        playerId;
-
-      const player2Left =
-        match.player2?.id ===
-        playerId;
-
-      if (
-        !player1Left &&
-        !player2Left
-      ) {
-        continue;
-      }
-
-      const opponent =
-        player1Left
-          ? match.player2
-          : match.player1;
-
-      if (!opponent) {
-        continue;
-      }
-
-      match.score1 =
-        player1Left ? 0 : 1;
-
-      match.score2 =
-        player2Left ? 0 : 1;
-
-      match.winner =
-        opponent;
-
-      match.forfeit = true;
-
-      match.playedAt =
-        Date.now();
-    }
-
-    /*
-     * Si el abandono termina una fase,
-     * hacemos avanzar el torneo.
-     */
-    if (
-      tournament.status ===
-      'REPESCA'
-    ) {
-      this.tryStartElimination(
-        tournament,
-      );
-    }
-
-    if (
-      tournament.status ===
-      'ELIMINATORIA'
-    ) {
-      this.tryAdvanceElimination(
-        tournament,
-      );
-    }
-
-    if (
-      tournament.status ===
-      'CLASIFICACION'
-    ) {
-      /*
-       * En clasificación, los partidos
-       * pendientes del jugador abandonado
-       * ya quedan resueltos por forfeit.
-       */
-    }
-  }
-
-  // =========================================================
-  // EXPULSAR
-  // =========================================================
-
-  kickPlayer(
-    pin: string,
-    playerId: string,
-  ):
-    | {
-        success: true;
-        player: Player;
-      }
-    | {
-        success: false;
-        error: string;
-      } {
-    const tournament =
-      this.tournaments.get(pin);
-
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
-
-    const player =
-      this.getPlayer(
+      this.resolveForfeitMatches(
         tournament,
         playerId,
       );
-
-    if (!player) {
-      return {
-        success: false,
-        error: 'Jugador no encontrado.',
-      };
-    }
-
-    tournament.bannedPlayerIds.push(
-      player.id,
-    );
-
-    tournament.bannedNicknames.push(
-      player.nickname.toLowerCase(),
-    );
-
-    const result =
-      this.removePlayer(
-        pin,
-        playerId,
-      );
-
-    if (!result.success) {
-      return {
-        success: false,
-        error:
-          result.error ??
-          'No se pudo expulsar.',
-      };
     }
 
     this.save();
@@ -1479,142 +1436,297 @@ export class TournamentService {
     };
   }
 
+  kickPlayer(
+    pin: string,
+    playerId: string,
+  ) {
+    const tournament =
+      this.getTournament(pin);
+
+    if (!tournament) {
+      return {
+        success: false,
+        error: 'Torneo no encontrado.',
+      };
+    }
+
+    const player =
+      this.getPlayer(
+        tournament,
+        playerId,
+      );
+
+    if (!player) {
+      return {
+        success: false,
+        error:
+          'Jugador no encontrado.',
+      };
+    }
+
+    tournament.bannedPlayerIds.push(
+      player.id,
+    );
+
+    const nickname =
+      player.nickname.toLowerCase();
+
+    if (
+      !tournament.bannedNicknames.includes(
+        nickname,
+      )
+    ) {
+      tournament.bannedNicknames.push(
+        nickname,
+      );
+    }
+
+    return this.removePlayer(
+      pin,
+      playerId,
+    );
+  }
+
+  private resolveForfeitMatches(
+    tournament: Tournament,
+    playerId: string,
+  ): void {
+    const pending =
+      tournament.matches.filter(
+        (match) =>
+          !match.played &&
+          (
+            match.player1Id ===
+              playerId ||
+            match.player2Id ===
+              playerId
+          ),
+      );
+
+    for (
+      const match of pending
+    ) {
+      const winnerId =
+        match.player1Id ===
+        playerId
+          ? match.player2Id
+          : match.player1Id;
+
+      const winner =
+        this.getPlayer(
+          tournament,
+          winnerId,
+        );
+
+      if (
+        !winner ||
+        winner.left
+      ) {
+        continue;
+      }
+
+      match.winnerId =
+        winnerId;
+
+      if (
+        match.player1Id ===
+        winnerId
+      ) {
+        match.score1 = 2;
+        match.score2 = 0;
+      } else {
+        match.score1 = 0;
+        match.score2 = 2;
+      }
+
+      match.played = true;
+
+      match.forfeit = true;
+
+      match.playedAt =
+        Date.now();
+
+      if (!match.game) {
+        match.game =
+          tournament.games[0] ??
+          null;
+      }
+    }
+
+    const hasRepesca =
+      tournament.matches.some(
+        (match) =>
+          match.stage ===
+          'repesca',
+      );
+
+    const hasEliminatoria =
+      tournament.matches.some(
+        (match) =>
+          match.stage ===
+          'eliminatoria',
+      );
+
+    if (
+      tournament.status ===
+      'REPESCA' &&
+      hasRepesca
+    ) {
+      this.tryStartElimination(
+        tournament,
+      );
+    }
+
+    if (
+      tournament.status ===
+      'ELIMINATORIA' &&
+      hasEliminatoria
+    ) {
+      this.tryAdvanceElimination(
+        tournament,
+      );
+    }
+  }
+
   // =========================================================
-  // SNAPSHOT PARA FRONTEND
+  // SNAPSHOT
   // =========================================================
 
   getSnapshot(
     pin: string,
   ): TournamentSnapshot | null {
     const tournament =
-      this.tournaments.get(pin);
+      this.getTournament(pin);
 
     if (!tournament) {
       return null;
     }
 
+    const players =
+      this.getActivePlayers(
+        tournament,
+      );
+
+    const standings =
+      this.getStandings(
+        tournament,
+      );
+
+    const plan =
+      this.getBracketPlan(
+        players.length,
+      );
+
+    const champion =
+      tournament.champion
+        ? this.getPlayer(
+            tournament,
+            tournament.champion,
+          ) ?? null
+        : null;
+
     return {
-      pin: tournament.pin,
+      pin:
 
-      phase: tournament.status,
+        tournament.pin,
 
-      plan: this.getBracketPlan(
-        tournament.players.length,
-      ),
+      phase:
+        tournament.status,
 
-      champion:
-        tournament.champion,
+      plan,
 
-      players:
-        tournament.players.filter(
-          (player) =>
-            !player.left,
-        ),
+      players,
 
-      games: [
-        ...tournament.games,
-      ],
+      games:
+        tournament.games,
 
       matches:
         tournament.matches,
 
-      standings:
-        this.getStandings(
-          tournament,
-        ),
+      standings,
+
+      champion,
     };
   }
 
   // =========================================================
-  // HISTORIAL DE UN JUGADOR
+  // ESTADO INDIVIDUAL
   // =========================================================
 
   getPlayerHistory(
     pin: string,
     playerId: string,
-  ) {
+  ): PlayerState | null {
     const tournament =
-      this.tournaments.get(pin);
+      this.getTournament(pin);
 
     if (!tournament) {
       return null;
     }
 
-    const history =
-      tournament.matches
-        .filter(
-          (match) =>
-            match.player1?.id ===
-              playerId ||
-            match.player2?.id ===
-              playerId,
-        )
-        .map((match) => {
-          const isPlayer1 =
-            match.player1?.id ===
-            playerId;
-
-          const opponent =
-            isPlayer1
-              ? match.player2
-              : match.player1;
-
-          return {
-            matchId: match.id,
-
-            stage: match.stage,
-
-            round: match.round,
-
-            label: match.label,
-
-            opponent,
-
-            game: match.game,
-
-            score1: match.score1,
-
-            score2: match.score2,
-
-            winner:
-              match.winner,
-
-            won:
-              match.winner?.id ===
-              playerId,
-
-            playedAt:
-              match.playedAt,
-
-            forfeit:
-              !!match.forfeit,
-          };
-        });
-
-    /*
-     * El próximo partido pendiente.
-     */
-    const currentMatch =
-      tournament.matches.find(
-        (match) =>
-          !match.winner &&
-          (
-            match.player1?.id ===
-              playerId ||
-            match.player2?.id ===
-              playerId
-          ),
+    const player =
+      this.getPlayer(
+        tournament,
+        playerId,
       );
 
-    const opponent =
-      currentMatch
-        ? currentMatch.player1?.id ===
-          playerId
-          ? currentMatch.player2
-          : currentMatch.player1
-        : null;
+    if (!player) {
+      return null;
+    }
+
+    const history =
+      this.getPlayerMatches(
+        tournament,
+        playerId,
+      );
+
+    const currentMatch =
+      history.find(
+        (match) =>
+          !match.played &&
+          (
+            match.player1Id ===
+              playerId ||
+            match.player2Id ===
+              playerId
+          ),
+      ) ?? null;
+
+    let opponent: Player | null =
+      null;
+
+    if (currentMatch) {
+      const opponentId =
+        currentMatch.player1Id ===
+        playerId
+          ? currentMatch.player2Id
+          : currentMatch.player1Id;
+
+      opponent =
+        this.getPlayer(
+          tournament,
+          opponentId,
+        ) ?? null;
+    }
+
+    const standings =
+      this.getStandings(
+        tournament,
+      );
+
+    const standing =
+      standings.find(
+        (item) =>
+          item.player.id ===
+          playerId,
+      );
 
     return {
+      player,
+
+      phase:
+        tournament.status,
+
       currentMatch,
 
       opponent,
@@ -1624,6 +1736,10 @@ export class TournamentService {
         null,
 
       history,
+
+      zone:
+        standing?.zone ??
+        null,
     };
   }
 }

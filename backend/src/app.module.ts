@@ -7,6 +7,10 @@ import { TournamentService } from './tournament.service';
 @Module({
   imports: [],
   controllers: [AppController],
-  providers: [AppService, TournamentGateway, TournamentService],
+  providers: [
+    AppService,
+    TournamentService,
+    TournamentGateway,
+  ],
 })
 export class AppModule {}
