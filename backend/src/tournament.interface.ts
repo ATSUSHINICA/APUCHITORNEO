@@ -1,13 +1,8 @@
-export interface Player {
-  id: string;
-  nickname: string;
-}
-
-export type TournamentStatus =
+export type TournamentPhase =
   | 'LOBBY'
-  | 'CLASSIFICATION'
+  | 'CLASIFICACION'
   | 'REPESCA'
-  | 'IN_PROGRESS'
+  | 'ELIMINATORIA'
   | 'FINISHED';
 
 export type MatchStage =
@@ -15,11 +10,23 @@ export type MatchStage =
   | 'repesca'
   | 'eliminatoria';
 
+export interface Player {
+  id: string;
+  nickname: string;
+  left?: boolean;
+}
+
 export interface Match {
   id: string;
 
   stage: MatchStage;
+
+  /**
+   * Jornada en clasificación.
+   * Ronda de eliminación en eliminatorias.
+   */
   round: number;
+
   label: string;
 
   player1: Player | null;
@@ -30,27 +37,102 @@ export interface Match {
 
   winner: Player | null;
 
-  game?: string;
+  /**
+   * Juego asignado aleatoriamente.
+   */
+  game: string | null;
 
+  /**
+   * Indica si el partido terminó por abandono.
+   */
   forfeit?: boolean;
+
+  /**
+   * Momento en el que se registró el resultado.
+   */
   playedAt?: number;
+}
+
+export interface Standing {
+  player: Player;
+
+  played: number;
+  wins: number;
+  diff: number;
+
+  zone: 'directo' | 'repesca' | 'fuera';
+
+  left: boolean;
+}
+
+export interface BracketPlan {
+  bracketSize: number;
+
+  /**
+   * Jugadores que pasan directamente.
+   */
+  direct: number;
+
+  /**
+   * Número de partidos de repesca.
+   */
+  repSlots: number;
+
+  /**
+   * Número de jugadores que participan en repesca.
+   */
+  repPlayers: number;
+
+  /**
+   * Jugadores eliminados directamente.
+   */
+  out: number;
+}
+
+export interface TournamentSnapshot {
+  pin: string;
+
+  phase: TournamentPhase;
+
+  plan: BracketPlan;
+
+  champion: Player | null;
+
+  players: Player[];
+
+  games: string[];
+
+  matches: Match[];
+
+  standings: Standing[];
 }
 
 export interface Tournament {
   pin: string;
+
   hostSocketId: string;
 
-  status: TournamentStatus;
+  status: TournamentPhase;
 
   players: Player[];
-  matches: Match[];
 
   games: string[];
 
+  matches: Match[];
+
+  /**
+   * Jugadores que han sido expulsados.
+   * Guardamos nickname e id para impedir que vuelvan.
+   */
+  bannedNicknames: string[];
+
+  bannedPlayerIds: string[];
+
   sequence: number;
+
   bracketRound: number;
 
-  direct: string[];
-
   champion: Player | null;
+
+  createdAt: number;
 }

@@ -1,9 +1,10 @@
 import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayDisconnect,
+  SubscribeMessage,
   WebSocketGateway,
   WebSocketServer,
-  SubscribeMessage,
-  MessageBody,
-  ConnectedSocket,
 } from '@nestjs/websockets';
 
 import { Server, Socket } from 'socket.io';
@@ -14,8 +15,11 @@ import { TournamentService } from './tournament.service';
   cors: {
     origin: '*',
   },
+  transports: ['websocket'],
 })
-export class TournamentGateway {
+export class TournamentGateway
+  implements OnGatewayDisconnect
+{
   @WebSocketServer()
   server: Server;
 
@@ -23,9 +27,107 @@ export class TournamentGateway {
     private readonly tournamentService: TournamentService,
   ) {}
 
-  // ─────────────────────────────────────────────
+  // =========================================================
+  // HELPERS
+  // =========================================================
+
+  private emitTournamentUpdate(
+    pin: string,
+  ): void {
+    const snapshot =
+      this.tournamentService.getSnapshot(pin);
+
+    if (!snapshot) {
+      return;
+    }
+
+    // Evento principal.
+    this.server
+      .to(pin)
+      .emit('tournament:updated', snapshot);
+
+    // Lo mantenemos para que tu App.tsx actual
+    // siga funcionando sin cambiar su apariencia.
+    this.server
+      .to(pin)
+      .emit('bracket:update', snapshot);
+
+    // Si acaba el torneo, avisamos también.
+    if (snapshot.phase === 'FINISHED') {
+      this.server
+        .to(pin)
+        .emit('tournament:end', {
+          champion: snapshot.champion,
+          snapshot,
+        });
+    }
+  }
+
+  private emitLobbyUpdate(
+    pin: string,
+  ): void {
+    const tournament =
+      this.tournamentService.getTournament(pin);
+
+    if (!tournament) {
+      return;
+    }
+
+    this.server
+      .to(pin)
+      .emit(
+        'lobby:update',
+        tournament.players.filter(
+          (player) => !player.left,
+        ),
+      );
+
+    this.emitTournamentUpdate(pin);
+  }
+
+  private emitPlayerState(
+    pin: string,
+  ): void {
+    const tournament =
+      this.tournamentService.getTournament(pin);
+
+    if (!tournament) {
+      return;
+    }
+
+    for (
+      const player of tournament.players
+    ) {
+      if (player.left) {
+        continue;
+      }
+
+      const state =
+        this.tournamentService.getPlayerHistory(
+          pin,
+          player.id,
+        );
+
+      this.server
+        .to(player.id)
+        .emit('player:state', state);
+    }
+  }
+
+  private isHost(
+    pin: string,
+    socketId: string,
+  ): boolean {
+    const tournament =
+      this.tournamentService.getTournament(pin);
+
+    return !!tournament &&
+      tournament.hostSocketId === socketId;
+  }
+
+  // =========================================================
   // CREAR TORNEO
-  // ─────────────────────────────────────────────
+  // =========================================================
 
   @SubscribeMessage('host:create')
   handleCreateTournament(
@@ -39,13 +141,19 @@ export class TournamentGateway {
     client.join(tournament.pin);
 
     return {
+      success: true,
+
       pin: tournament.pin,
+
+      games: tournament.games,
+
+      phase: tournament.status,
     };
   }
 
-  // ─────────────────────────────────────────────
-  // UNIR JUGADOR
-  // ─────────────────────────────────────────────
+  // =========================================================
+  // UNIRSE AL TORNEO
+  // =========================================================
 
   @SubscribeMessage('player:join')
   handleJoinTournament(
@@ -55,84 +163,70 @@ export class TournamentGateway {
       nickname: string;
     },
 
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket()
+    client: Socket,
   ) {
-    const pin = data.pin.trim();
-    const nickname = data.nickname.trim();
+    if (!data?.pin || !data?.nickname) {
+      return {
+        success: false,
+        error:
+          'Debes introducir el PIN y un apodo.',
+      };
+    }
+
+    const result =
+      this.tournamentService.addPlayer(
+        data.pin,
+        {
+          id: client.id,
+          nickname: data.nickname,
+        },
+      );
+
+    if (!result.success) {
+      return result;
+    }
+
+    client.join(data.pin);
 
     const tournament =
       this.tournamentService.getTournament(
-        pin,
+        data.pin,
       );
 
     if (!tournament) {
       return {
-        error:
-          'No existe ningún torneo con ese PIN.',
-      };
-    }
-
-    if (tournament.status !== 'LOBBY') {
-      return {
-        error:
-          'El torneo ya ha comenzado.',
-      };
-    }
-
-    if (!nickname) {
-      return {
-        error:
-          'Escribe un apodo.',
-      };
-    }
-
-    const success =
-      this.tournamentService.addPlayer(
-        pin,
-        {
-          id: client.id,
-          nickname,
-        },
-      );
-
-    if (!success) {
-      return {
-        error:
-          'Ese apodo ya está en uso en este torneo.',
-      };
-    }
-
-    client.join(pin);
-
-    const updatedTournament =
-      this.tournamentService.getTournament(
-        pin,
-      );
-
-    if (!updatedTournament) {
-      return {
+        success: false,
         error:
           'Torneo no encontrado.',
       };
     }
 
-    // Actualizar lobby
-    this.server
-      .to(pin)
-      .emit(
-        'lobby:update',
-        updatedTournament.players,
-      );
+    // Actualizamos lobby.
+    this.emitLobbyUpdate(
+      data.pin,
+    );
 
     return {
       success: true,
-      playerId: client.id,
+
+      pin: data.pin,
+
+      players:
+        tournament.players.filter(
+          (player) =>
+            !player.left,
+        ),
+
+      games: tournament.games,
+
+      phase: tournament.status,
     };
   }
 
-  // ─────────────────────────────────────────────
+  // =========================================================
   // INICIAR TORNEO
-  // ─────────────────────────────────────────────
+  // =========================================================
 
   @SubscribeMessage('host:start')
   handleStartTournament(
@@ -141,8 +235,21 @@ export class TournamentGateway {
       pin: string;
     },
 
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket()
+    client: Socket,
   ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error: 'No autorizado.',
+      };
+    }
+
     const tournament =
       this.tournamentService.getTournament(
         data.pin,
@@ -150,18 +257,9 @@ export class TournamentGateway {
 
     if (!tournament) {
       return {
+        success: false,
         error:
           'Torneo no encontrado.',
-      };
-    }
-
-    if (
-      tournament.hostSocketId !==
-      client.id
-    ) {
-      return {
-        error:
-          'No autorizado.',
       };
     }
 
@@ -169,52 +267,117 @@ export class TournamentGateway {
       tournament.players.length < 2
     ) {
       return {
+        success: false,
         error:
-          'Hacen falta al menos 2 jugadores.',
+          'Se necesitan al menos 2 jugadores.',
       };
     }
 
-    const started =
-      this.tournamentService.startTournament(
-        data.pin,
-      );
-
-    if (!started) {
+    if (
+      tournament.status !== 'LOBBY'
+    ) {
       return {
+        success: false,
         error:
-          'No se pudo iniciar el torneo.',
+          'El torneo ya ha comenzado.',
       };
     }
+
+    const matches =
+      this.tournamentService.generateClassification(
+        tournament,
+      );
 
     const snapshot =
       this.tournamentService.getSnapshot(
-        started,
+        data.pin,
       );
 
+    // Evento que ya utiliza tu frontend.
     this.server
       .to(data.pin)
-      .emit(
-        'tournament:started',
-        snapshot,
-      );
+      .emit('tournament:started', {
+        matches,
 
-    // También enviamos bracket:update
-    // para mantener compatibilidad con tu App.tsx.
-    this.server
-      .to(data.pin)
-      .emit(
-        'bracket:update',
         snapshot,
-      );
+      });
+
+    // Evento adicional para mantener todo sincronizado.
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    this.emitPlayerState(
+      data.pin,
+    );
 
     return {
       success: true,
+
+      matches,
+
+      snapshot,
     };
   }
 
-  // ─────────────────────────────────────────────
-  // RESULTADO
-  // ─────────────────────────────────────────────
+  // =========================================================
+  // CERRAR CLASIFICACIÓN
+  // =========================================================
+
+  @SubscribeMessage(
+    'host:lockClassification',
+  )
+  handleLockClassification(
+    @MessageBody()
+    data: {
+      pin: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error: 'No autorizado.',
+      };
+    }
+
+    const result =
+      this.tournamentService.lockClassification(
+        data.pin,
+      );
+
+    if (!result.success) {
+      return result;
+    }
+
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    this.emitPlayerState(
+      data.pin,
+    );
+
+    return {
+      success: true,
+
+      snapshot:
+        this.tournamentService.getSnapshot(
+          data.pin,
+        ),
+    };
+  }
+
+  // =========================================================
+  // REGISTRAR RESULTADO
+  // =========================================================
 
   @SubscribeMessage('host:setResult')
   handleSetResult(
@@ -226,30 +389,29 @@ export class TournamentGateway {
       score2: number;
     },
 
-    @ConnectedSocket() client: Socket,
+    @ConnectedSocket()
+    client: Socket,
   ) {
-    const tournament =
-      this.tournamentService.getTournament(
-        data.pin,
-      );
-
-    if (!tournament) {
-      return {
-        error:
-          'Torneo no encontrado.',
-      };
-    }
-
     if (
-      tournament.hostSocketId !==
-      client.id
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
     ) {
       return {
-        error:
-          'No autorizado.',
+        success: false,
+        error: 'No autorizado.',
       };
     }
 
+    /*
+     * IMPORTANTE:
+     *
+     * Ya NO necesitamos winnerId.
+     *
+     * El backend determina automáticamente
+     * el ganador mediante score1 y score2.
+     */
     const result =
       this.tournamentService.setMatchResult(
         data.pin,
@@ -258,146 +420,381 @@ export class TournamentGateway {
         Number(data.score2),
       );
 
-    if (!result) {
+    if (!result.success) {
+      return result;
+    }
+
+    /*
+     * Todos reciben el nuevo cuadro.
+     */
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    /*
+     * Cada jugador recibe también
+     * su rival, juego e historial.
+     */
+    this.emitPlayerState(
+      data.pin,
+    );
+
+    return {
+      success: true,
+
+      finished:
+        result.isFinished,
+
+      snapshot:
+        this.tournamentService.getSnapshot(
+          data.pin,
+        ),
+    };
+  }
+
+  // =========================================================
+  // AÑADIR JUEGO
+  // =========================================================
+
+  @SubscribeMessage('host:addGame')
+  handleAddGame(
+    @MessageBody()
+    data: {
+      pin: string;
+      game: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
       return {
-        error:
-          'No se pudo actualizar el partido. Comprueba el marcador.',
+        success: false,
+        error: 'No autorizado.',
       };
     }
 
-    const snapshot =
-      this.tournamentService.getSnapshot(
-        result.tournament,
+    const result =
+      this.tournamentService.addGame(
+        data.pin,
+        data.game,
       );
 
-    // Actualización del cuadro
-    this.server
-      .to(data.pin)
-      .emit(
-        'bracket:update',
-        snapshot,
-      );
-
-    // Compatibilidad con tu App actual
-    this.server
-      .to(data.pin)
-      .emit(
-        'tournament:updated',
-        snapshot,
-      );
-
-    // Si ha terminado
-    if (result.isFinished) {
-      this.server
-        .to(data.pin)
-        .emit(
-          'tournament:end',
-          {
-            winner:
-              result.tournament.champion,
-          },
-        );
+    if (!result.success) {
+      return result;
     }
+
+    /*
+     * Actualizamos la lista de juegos
+     * de todos los participantes.
+     */
+    this.server
+      .to(data.pin)
+      .emit('games:update', {
+        games: result.games,
+      });
+
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    return result;
+  }
+
+  // =========================================================
+  // ELIMINAR JUEGO
+  // =========================================================
+
+  @SubscribeMessage('host:removeGame')
+  handleRemoveGame(
+    @MessageBody()
+    data: {
+      pin: string;
+      game: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error: 'No autorizado.',
+      };
+    }
+
+    const result =
+      this.tournamentService.removeGame(
+        data.pin,
+        data.game,
+      );
+
+    if (!result.success) {
+      return result;
+    }
+
+    this.server
+      .to(data.pin)
+      .emit('games:update', {
+        games: result.games,
+      });
+
+    this.emitTournamentUpdate(
+      data.pin,
+    );
+
+    return result;
+  }
+
+  // =========================================================
+  // EXPULSAR JUGADOR
+  // =========================================================
+
+  @SubscribeMessage('host:kick')
+  handleKickPlayer(
+    @MessageBody()
+    data: {
+      pin: string;
+      playerId: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    if (
+      !this.isHost(
+        data.pin,
+        client.id,
+      )
+    ) {
+      return {
+        success: false,
+        error: 'No autorizado.',
+      };
+    }
+
+    const result =
+      this.tournamentService.kickPlayer(
+        data.pin,
+        data.playerId,
+      );
+
+    if (!result.success) {
+      return result;
+    }
+
+    /*
+     * Avisamos directamente al jugador expulsado.
+     */
+    this.server
+      .to(data.playerId)
+      .emit('player:kicked', {
+        message:
+          'Has sido expulsado del torneo.',
+      });
+
+    /*
+     * Lo sacamos de la sala Socket.IO.
+     */
+    const kickedSocket =
+      this.server.sockets.sockets.get(
+        data.playerId,
+      );
+
+    if (kickedSocket) {
+      kickedSocket.leave(
+        data.pin,
+      );
+    }
+
+    this.emitLobbyUpdate(
+      data.pin,
+    );
+
+    this.emitPlayerState(
+      data.pin,
+    );
 
     return {
       success: true,
+
+      player: result.player,
     };
   }
 
-  // ─────────────────────────────────────────────
-  // SALIR DEL TORNEO
-  // ─────────────────────────────────────────────
+  // =========================================================
+  // SALIR VOLUNTARIAMENTE
+  // =========================================================
 
   @SubscribeMessage('player:leave')
   handlePlayerLeave(
-    @ConnectedSocket() client: Socket,
-  ) {
-    for (
-      const [
-        pin,
-        tournament,
-      ] of this.getAllTournaments()
-    ) {
-      if (
-        tournament.status === 'LOBBY'
-      ) {
-      const player = tournament.players.find(
-        (p: { id: string }) => p.id === client.id,
-      );
+    @MessageBody()
+    data: {
+      pin?: string;
+    },
 
-        if (player) {
-          this.tournamentService.removePlayer(
-            pin,
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    const tournament =
+      data?.pin
+        ? this.tournamentService.getTournament(
+            data.pin,
+          )
+        : this.tournamentService.findTournamentBySocket(
             client.id,
           );
 
-          this.server
-            .to(pin)
-            .emit(
-              'lobby:update',
-              tournament.players,
-            );
-
-          client.leave(pin);
-
-          return {
-            success: true,
-          };
-        }
-      }
+    if (!tournament) {
+      return {
+        success: false,
+        error:
+          'No estás dentro de ningún torneo.',
+      };
     }
+
+    const pin =
+      tournament.pin;
+
+    const result =
+      this.tournamentService.removePlayer(
+        pin,
+        client.id,
+      );
+
+    client.leave(pin);
+
+    if (!result.success) {
+      return result;
+    }
+
+    this.emitLobbyUpdate(pin);
+
+    this.emitPlayerState(pin);
 
     return {
       success: true,
     };
   }
 
-  // ─────────────────────────────────────────────
-  // DESCONEXIÓN
-  // ─────────────────────────────────────────────
+  // =========================================================
+  // DESCONEXIÓN AUTOMÁTICA
+  // =========================================================
 
   handleDisconnect(
     client: Socket,
   ) {
-    for (
-      const [
-        pin,
-        tournament,
-      ] of this.getAllTournaments()
-    ) {
-      const player = tournament.players.find(
-        (p: { id: string }) => p.id === client.id,
+    const tournament =
+      this.tournamentService.findTournamentBySocket(
+        client.id,
       );
 
-      if (
-        player &&
-        tournament.status === 'LOBBY'
-      ) {
-        this.tournamentService.removePlayer(
-          pin,
-          client.id,
-        );
-
-        this.server
-          .to(pin)
-          .emit(
-            'lobby:update',
-            tournament.players,
-          );
-      }
+    if (!tournament) {
+      return;
     }
+
+    /*
+     * Si era jugador, se elimina automáticamente.
+     *
+     * Si era el host, de momento no destruimos
+     * el torneo: queda guardado.
+     */
+    if (
+      tournament.hostSocketId ===
+      client.id
+    ) {
+      return;
+    }
+
+    const pin =
+      tournament.pin;
+
+    const result =
+      this.tournamentService.removePlayer(
+        pin,
+        client.id,
+      );
+
+    if (!result.success) {
+      return;
+    }
+
+    this.emitLobbyUpdate(pin);
+
+    this.emitPlayerState(pin);
   }
 
-  // Acceso al Map privado del service.
-  // Para evitarlo, de momento mantenemos
-  // la gestión de desconexión principalmente
-  // desde player:leave.
-  private getAllTournaments(): Map<
-    string,
-    any
-  > {
-    return (
-      this.tournamentService as any
-    ).tournaments;
+  // =========================================================
+  // PEDIR ESTADO ACTUAL
+  // =========================================================
+
+  @SubscribeMessage(
+    'tournament:getState',
+  )
+  handleGetState(
+    @MessageBody()
+    data: {
+      pin: string;
+    },
+
+    @ConnectedSocket()
+    client: Socket,
+  ) {
+    const snapshot =
+      this.tournamentService.getSnapshot(
+        data.pin,
+      );
+
+    if (!snapshot) {
+      return {
+        success: false,
+        error:
+          'Torneo no encontrado.',
+      };
+    }
+
+    client.join(data.pin);
+
+    /*
+     * Estado general.
+     */
+    client.emit(
+      'tournament:updated',
+      snapshot,
+    );
+
+    /*
+     * Estado específico del jugador.
+     */
+    const playerState =
+      this.tournamentService.getPlayerHistory(
+        data.pin,
+        client.id,
+      );
+
+    if (playerState) {
+      client.emit(
+        'player:state',
+        playerState,
+      );
+    }
+
+    return {
+      success: true,
+
+      snapshot,
+
+      playerState,
+    };
   }
 }

@@ -6,15 +6,36 @@ import {
 import { socket } from './src/services/socket';
 
 /* ───────── Tipos ───────── */
-type Player = { id: string; nickname: string };
+type Player = {
+  id: string;
+  nickname: string;
+  left?: boolean;
+};
+
 type Match = {
   id: string;
   round?: number;
+  stage?: string;
   player1?: Player | null;
   player2?: Player | null;
+  p1?: string;
+  p2?: string;
   score1?: number | null;
   score2?: number | null;
   winnerId?: string | null;
+  game?: string | null;
+  playedAt?: number;
+};
+
+type TournamentState = {
+  phase?: string;
+  status?: string;
+  matches?: Match[];
+  games?: string[];
+  direct?: Player[];
+  repechagePlayers?: Player[];
+  eliminated?: Player[];
+  champion?: Player | null;
 };
 type Screen = 'home' | 'lobby' | 'bracket';
 type Kind = 'green' | 'blue' | 'red' | 'yellow' | 'ink' | 'ghost';
@@ -148,50 +169,261 @@ export default function App() {
   const [scoring, setScoring] = useState<Match | null>(null);
   const [sc1, setSc1] = useState(0);
   const [sc2, setSc2] = useState(0);
+  const [games, setGames] = useState<string[]>([]);
+  const [newGame, setNewGame] = useState('');
+  const [tournamentState, setTournamentState] = useState<TournamentState>({});
+  const [showGames, setShowGames] = useState(false);
+  const [showPlayers, setShowPlayers] = useState(false);
 
-  useEffect(() => {
-    const onLobby = (p: Player[]) => setPlayers(p);
-    const onStart = (d: any) => { setMatches(toMatches(d)); setScreen('bracket'); };
-    const onBracket = (d: any) => setMatches(toMatches(d));
-    const onEnd = (d: any) => setChampion(d?.winner?.nickname ?? d?.winner ?? null);
-    const onConn = () => setConnected(true);
-    const onDisc = () => setConnected(false);
+useEffect(() => {
+  const onLobby = (p: Player[]) => {
+    setPlayers(p);
+  };
 
-    socket.on('lobby:update', onLobby);
-    socket.on('tournament:started', onStart);
-    socket.on('bracket:update', onBracket);
-    socket.on('tournament:end', onEnd);
-    socket.on('connect', onConn);
-    socket.on('disconnect', onDisc);
-    return () => {
-      socket.off('lobby:update', onLobby);
-      socket.off('tournament:started', onStart);
-      socket.off('bracket:update', onBracket);
-      socket.off('tournament:end', onEnd);
-      socket.off('connect', onConn);
-      socket.off('disconnect', onDisc);
-    };
-  }, []);
+  const onStart = (d: any) => {
+    setTournamentState(d ?? {});
+    setGames(d?.games ?? []);
+    setMatches(toMatches(d));
+    setScreen('bracket');
+  };
+
+  const onBracket = (d: any) => {
+    setTournamentState(d ?? {});
+    setGames(d?.games ?? games);
+    setMatches(toMatches(d));
+
+    if (d?.champion) {
+      setChampion(
+        typeof d.champion === 'string'
+          ? d.champion
+          : d.champion.nickname
+      );
+    }
+  };
+
+  const onGames = (list: string[]) => {
+    setGames(list);
+  };
+
+  const onEnd = (d: any) => {
+    setChampion(
+      d?.winner?.nickname ??
+      d?.winner ??
+      null
+    );
+  };
+
+  const onKicked = () => {
+    Alert.alert(
+      'Has sido expulsado',
+      'El anfitrión te ha eliminado del torneo.'
+    );
+
+    setScreen('home');
+    setPin('');
+    setPlayers([]);
+    setMatches([]);
+    setIsHost(false);
+    setMyId(null);
+  };
+
+  const onClosed = () => {
+    Alert.alert(
+      'Torneo cerrado',
+      'El anfitrión ha cerrado el torneo.'
+    );
+
+    setScreen('home');
+    setPin('');
+    setPlayers([]);
+    setMatches([]);
+    setIsHost(false);
+    setMyId(null);
+  };
+
+  const onConn = () => setConnected(true);
+  const onDisc = () => setConnected(false);
+
+  socket.on('lobby:update', onLobby);
+  socket.on('tournament:started', onStart);
+  socket.on('bracket:update', onBracket);
+  socket.on('tournament:end', onEnd);
+  socket.on('games:update', onGames);
+  socket.on('kicked', onKicked);
+  socket.on('tournament:closed', onClosed);
+  socket.on('connect', onConn);
+  socket.on('disconnect', onDisc);
+
+  return () => {
+    socket.off('lobby:update', onLobby);
+    socket.off('tournament:started', onStart);
+    socket.off('bracket:update', onBracket);
+    socket.off('tournament:end', onEnd);
+    socket.off('games:update', onGames);
+    socket.off('kicked', onKicked);
+    socket.off('tournament:closed', onClosed);
+    socket.off('connect', onConn);
+    socket.off('disconnect', onDisc);
+  };
+}, []);
 
   /* Acciones */
-  const createTournament = () => {
-    socket.emit('host:create', (res: { pin: string }) => {
-      if (res?.pin) { setPin(res.pin); setIsHost(true); setScreen('lobby'); }
-      else Alert.alert('No se pudo crear', 'Revisa la conexión con el servidor e inténtalo de nuevo.');
-    });
+useEffect(() => {
+  const onLobby = (p: Player[]) => {
+    setPlayers(p);
   };
 
-  const joinTournament = () => {
-    if (!pin.trim() || !nickname.trim()) {
-      Alert.alert('Faltan datos', 'Escribe el PIN y tu apodo para entrar.');
+  const onStart = (d: any) => {
+    setTournamentState(d ?? {});
+    setGames(d?.games ?? []);
+    setMatches(toMatches(d));
+    setScreen('bracket');
+  };
+
+  const onBracket = (d: any) => {
+    setTournamentState(d ?? {});
+    setGames(d?.games ?? games);
+    setMatches(toMatches(d));
+
+    if (d?.champion) {
+      setChampion(
+        typeof d.champion === 'string'
+          ? d.champion
+          : d.champion.nickname
+      );
+    }
+  };
+
+  const onGames = (list: string[]) => {
+    setGames(list);
+  };
+
+  const onEnd = (d: any) => {
+    setChampion(
+      d?.winner?.nickname ??
+      d?.winner ??
+      null
+    );
+  };
+
+  const onKicked = () => {
+    Alert.alert(
+      'Has sido expulsado',
+      'El anfitrión te ha eliminado del torneo.'
+    );
+
+    setScreen('home');
+    setPin('');
+    setPlayers([]);
+    setMatches([]);
+    setIsHost(false);
+    setMyId(null);
+  };
+
+  const onClosed = () => {
+    Alert.alert(
+      'Torneo cerrado',
+      'El anfitrión ha cerrado el torneo.'
+    );
+
+    setScreen('home');
+    setPin('');
+    setPlayers([]);
+    setMatches([]);
+    setIsHost(false);
+    setMyId(null);
+  };
+
+  const onConn = () => setConnected(true);
+  const onDisc = () => setConnected(false);
+
+  socket.on('lobby:update', onLobby);
+  socket.on('tournament:started', onStart);
+  socket.on('bracket:update', onBracket);
+  socket.on('tournament:end', onEnd);
+  socket.on('games:update', onGames);
+  socket.on('kicked', onKicked);
+  socket.on('tournament:closed', onClosed);
+  socket.on('connect', onConn);
+  socket.on('disconnect', onDisc);
+
+  return () => {
+    socket.off('lobby:update', onLobby);
+    socket.off('tournament:started', onStart);
+    socket.off('bracket:update', onBracket);
+    socket.off('tournament:end', onEnd);
+    socket.off('games:update', onGames);
+    socket.off('kicked', onKicked);
+    socket.off('tournament:closed', onClosed);
+    socket.off('connect', onConn);
+    socket.off('disconnect', onDisc);
+  };
+}, []);
+
+  
+/* ───────── Acciones ───────── */
+
+const createTournament = () => {
+  socket.emit('host:create', (res: any) => {
+    if (res?.error) {
+      Alert.alert('No se pudo crear', res.error);
       return;
     }
-    socket.emit('player:join', { pin: pin.trim(), nickname: nickname.trim() }, (res: any) => {
-      if (res?.error) { Alert.alert('No pudiste entrar', res.error); return; }
-      setMyId(res?.playerId ?? res?.player?.id ?? socket.id ?? null);
+
+    if (!res?.pin) {
+      Alert.alert(
+        'Error',
+        'El servidor no devolvió el PIN del torneo.'
+      );
+      return;
+    }
+
+    setPin(String(res.pin));
+    setIsHost(true);
+    setMyId(socket.id ?? null);
+    setGames(res.games ?? []);
+    setPlayers([]);
+    setMatches([]);
+    setChampion(null);
+    setScreen('lobby');
+  });
+};
+
+const joinTournament = () => {
+  if (!pin.trim() || !nickname.trim()) {
+    Alert.alert(
+      'Faltan datos',
+      'Escribe el PIN y tu apodo para entrar.'
+    );
+    return;
+  }
+
+  socket.emit(
+    'player:join',
+    {
+      pin: pin.trim(),
+      nickname: nickname.trim(),
+    },
+    (res: any) => {
+      if (res?.error) {
+        Alert.alert('No pudiste entrar', res.error);
+        return;
+      }
+
+      setMyId(
+        res?.playerId ??
+        res?.player?.id ??
+        socket.id ??
+        null
+      );
+
+      setIsHost(false);
       setScreen('lobby');
-    });
-  };
+    },
+  );
+};
+
+
 
   const startTournament = () => socket.emit('host:start', { pin });
 
@@ -251,7 +483,7 @@ const confirmScore = () => {
           <View style={s.logoRow}>
             {[C.red, C.blue, C.yellow, C.green].map((c) => <View key={c} style={[s.logoSq, { backgroundColor: c }]} />)}
           </View>
-          <Text style={s.logo}>TORNEO</Text>
+          <Text style={s.logo}>TORNEO APUCHINICA</Text>
           <Text style={s.tag}>Compite. Gana. Repite.</Text>
 
           <View style={s.panel}>
