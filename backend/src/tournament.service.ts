@@ -1,21 +1,19 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { randomBytes } from 'crypto';
-import {
-  existsSync,
-  readFileSync,
-  writeFileSync,
-} from 'fs';
+import { existsSync, promises as fsp, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 
 import {
   BracketPlan,
+  HistoryEntry,
   Match,
   MatchStage,
   Player,
   PlayerState,
+  PublicPlayer,
+  SnapshotMatch,
   Standing,
   Tournament,
-  TournamentPhase,
   TournamentSnapshot,
 } from './tournament.interface';
 
@@ -42,14 +40,36 @@ const DEFAULT_GAMES = [
   'Kimetsu no Yaiba',
 ];
 
+const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const MAX_NICK = 16;
+const MAX_GAME = 30;
+
+type Fail = { success: false; error: string };
+const fail = (error: string): Fail => ({ success: false, error });
+const newId = () => randomBytes(6).toString('hex');
+const newToken = () => randomBytes(16).toString('hex');
+
 @Injectable()
-export class TournamentService {
+export class TournamentService implements OnModuleDestroy {
   private readonly filePath = join(process.cwd(), 'torneos.json');
 
   private tournaments: Record<string, Tournament> = {};
 
+  private saveTimer: NodeJS.Timeout | null = null;
+  private flushing = false;
+  private dirty = false;
+
   constructor() {
     this.load();
+  }
+
+  onModuleDestroy() {
+    if (this.saveTimer) clearTimeout(this.saveTimer);
+    try {
+      writeFileSync(this.filePath, JSON.stringify(this.tournaments), 'utf8');
+    } catch {
+      /* nada que hacer al cerrar */
+    }
   }
 
   // =========================================================
@@ -58,27 +78,63 @@ export class TournamentService {
 
   private load(): void {
     try {
-      if (!existsSync(this.filePath)) {
-        this.tournaments = {};
-        return;
+      if (existsSync(this.filePath)) {
+        const raw = readFileSync(this.filePath, 'utf8');
+        this.tournaments = raw ? JSON.parse(raw) : {};
       }
-
-      const raw = readFileSync(this.filePath, 'utf8');
-
-      this.tournaments = raw
-        ? JSON.parse(raw)
-        : {};
     } catch {
       this.tournaments = {};
     }
+
+    for (const [pin, t] of Object.entries(this.tournaments)) {
+      // Descarta ficheros con el formato antiguo.
+      if (!t.hostToken) {
+        delete this.tournaments[pin];
+        continue;
+      }
+      // Tras un reinicio nadie está conectado: tendrán que reentrar con su token.
+      t.hostSocketId = null;
+      t.hostConnected = false;
+      for (const p of t.players) {
+        p.socketId = null;
+        p.connected = false;
+      }
+    }
+
+    this.purgeOld();
   }
 
-  private save(): void {
-    writeFileSync(
-      this.filePath,
-      JSON.stringify(this.tournaments, null, 2),
-      'utf8',
-    );
+  /** Guarda en diferido y sin bloquear el hilo principal. */
+  private scheduleSave(): void {
+    this.dirty = true;
+    if (this.saveTimer || this.flushing) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      void this.flush();
+    }, 300);
+  }
+
+  private async flush(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
+    this.dirty = false;
+    const tmp = `${this.filePath}.tmp`;
+    try {
+      await fsp.writeFile(tmp, JSON.stringify(this.tournaments), 'utf8');
+      await fsp.rename(tmp, this.filePath);
+    } catch (error) {
+      console.error('No se pudo guardar torneos.json', error);
+    } finally {
+      this.flushing = false;
+      if (this.dirty) this.scheduleSave();
+    }
+  }
+
+  private purgeOld(): void {
+    const limit = Date.now() - MAX_AGE_MS;
+    for (const [pin, t] of Object.entries(this.tournaments)) {
+      if (t.createdAt < limit) delete this.tournaments[pin];
+    }
   }
 
   // =========================================================
@@ -87,385 +143,376 @@ export class TournamentService {
 
   private generatePin(): string {
     let pin = '';
-
     do {
-      pin = String(
-        Math.floor(
-          100000 + Math.random() * 900000,
-        ),
-      );
+      pin = String(Math.floor(100000 + Math.random() * 900000));
     } while (this.tournaments[pin]);
-
     return pin;
-  }
-
-  private generateId(): string {
-    return randomBytes(6).toString('hex');
   }
 
   private shuffle<T>(array: T[]): T[] {
     const result = [...array];
-
     for (let i = result.length - 1; i > 0; i--) {
-      const j = Math.floor(
-        Math.random() * (i + 1),
-      );
-
-      [result[i], result[j]] = [
-        result[j],
-        result[i],
-      ];
+      const j = Math.floor(Math.random() * (i + 1));
+      [result[i], result[j]] = [result[j], result[i]];
     }
-
     return result;
   }
 
-  private getPlayer(
-    tournament: Tournament,
-    playerId: string,
-  ): Player | undefined {
-    return tournament.players.find(
-      (player) => player.id === playerId,
-    );
+  private nextPow2(n: number): number {
+    let p = 2;
+    while (p < n) p *= 2;
+    return p;
   }
 
-  private getActivePlayers(
-    tournament: Tournament,
-  ): Player[] {
-    return tournament.players.filter(
-      (player) => !player.left,
-    );
+  /** Orden estándar de un cuadro: 1 vs N, 4 vs N-3, ... (los mejores no se cruzan pronto). */
+  private bracketOrder(size: number): number[] {
+    let order = [1];
+    while (order.length < size) {
+      const n = order.length * 2;
+      order = order.flatMap((seed) => [seed, n + 1 - seed]);
+    }
+    return order;
   }
 
-  private getMatch(
-    tournament: Tournament,
-    matchId: string,
-  ): Match | undefined {
-    return tournament.matches.find(
-      (match) => match.id === matchId,
-    );
+  private pub(player: Player): PublicPlayer {
+    return {
+      id: player.id,
+      nickname: player.nickname,
+      connected: player.connected,
+      left: player.left,
+    };
   }
 
-  private getPlayerMatches(
-    tournament: Tournament,
-    playerId: string,
-  ): Match[] {
-    return tournament.matches.filter(
-      (match) =>
-        match.player1Id === playerId ||
-        match.player2Id === playerId,
-    );
+  private pubById(t: Tournament, id: string | null): PublicPlayer | null {
+    const player = id ? this.getPlayer(t, id) : undefined;
+    return player ? this.pub(player) : null;
+  }
+
+  private getPlayer(t: Tournament, id: string): Player | undefined {
+    return t.players.find((p) => p.id === id);
+  }
+
+  private getActivePlayers(t: Tournament): Player[] {
+    return t.players.filter((p) => !p.left);
+  }
+
+  private getMatch(t: Tournament, id: string): Match | undefined {
+    return t.matches.find((m) => m.id === id);
+  }
+
+  private toSnapshotMatch(t: Tournament, m: Match): SnapshotMatch {
+    return {
+      ...m,
+      player1: this.pubById(t, m.player1Id),
+      player2: this.pubById(t, m.player2Id),
+    };
   }
 
   // =========================================================
-  // TORNEO
+  // TORNEO Y SESIONES
   // =========================================================
 
-  createTournament(
-    hostSocketId: string,
-  ): Tournament {
-    const pin = this.generatePin();
+  createTournament(hostSocketId: string): Tournament {
+    this.purgeOld();
+
+    // Evita acumular lobbies vacíos del mismo anfitrión.
+    for (const [pin, old] of Object.entries(this.tournaments)) {
+      if (
+        old.hostSocketId === hostSocketId &&
+        old.status === 'LOBBY' &&
+        old.players.length === 0
+      ) {
+        delete this.tournaments[pin];
+      }
+    }
 
     const tournament: Tournament = {
-      pin,
-
+      pin: this.generatePin(),
+      hostToken: newToken(),
       hostSocketId,
-
+      hostConnected: true,
       status: 'LOBBY',
-
       players: [],
-
       games: [...DEFAULT_GAMES],
-
       matches: [],
-
       bannedNicknames: [],
-
       bannedPlayerIds: [],
-
       sequence: 0,
-
       bracketRound: 0,
-
+      roundSlots: [],
+      frozenStandings: null,
       champion: null,
-
       createdAt: Date.now(),
     };
 
-    this.tournaments[pin] = tournament;
-
-    this.save();
-
+    this.tournaments[tournament.pin] = tournament;
+    this.scheduleSave();
     return tournament;
   }
 
-  getTournament(
-    pin: string,
-  ): Tournament | undefined {
+  getTournament(pin: string): Tournament | undefined {
     return this.tournaments[pin];
   }
 
-  findTournamentBySocket(
-    socketId: string,
-  ): Tournament | undefined {
-    return Object.values(this.tournaments).find(
-      (tournament) =>
-        tournament.hostSocketId === socketId ||
-        tournament.players.some(
-          (player) => player.id === socketId,
-        ),
-    );
+  deleteTournament(pin: string): void {
+    delete this.tournaments[pin];
+    this.scheduleSave();
+  }
+
+  isHost(pin: string, socketId: string): boolean {
+    const t = this.tournaments[pin];
+    return !!t && t.hostSocketId === socketId;
+  }
+
+  findBySocket(socketId: string) {
+    for (const tournament of Object.values(this.tournaments)) {
+      if (tournament.hostSocketId === socketId) {
+        return { tournament, role: 'host' as const, player: undefined };
+      }
+      const player = tournament.players.find(
+        (p) => p.socketId === socketId && !p.left,
+      );
+      if (player) {
+        return { tournament, role: 'player' as const, player };
+      }
+    }
+    return undefined;
+  }
+
+  getPlayerById(pin: string, playerId: string): Player | undefined {
+    const t = this.getTournament(pin);
+    return t ? this.getPlayer(t, playerId) : undefined;
+  }
+
+  listDisconnected(): { pin: string; playerId: string }[] {
+    const list: { pin: string; playerId: string }[] = [];
+    for (const t of Object.values(this.tournaments)) {
+      for (const p of t.players) {
+        if (!p.left && !p.connected) list.push({ pin: t.pin, playerId: p.id });
+      }
+    }
+    return list;
+  }
+
+  setPlayerConnected(pin: string, playerId: string, connected: boolean): void {
+    const player = this.getPlayerById(pin, playerId);
+    if (!player) return;
+    player.connected = connected;
+    if (!connected) player.socketId = null;
+    this.scheduleSave();
+  }
+
+  setHostConnected(pin: string, connected: boolean): void {
+    const t = this.getTournament(pin);
+    if (!t) return;
+    t.hostConnected = connected;
+    this.scheduleSave();
+  }
+
+  rejoinHost(pin: string, hostToken: string, socketId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
+    if (!hostToken || t.hostToken !== hostToken) return fail('No autorizado.');
+    t.hostSocketId = socketId;
+    t.hostConnected = true;
+    this.scheduleSave();
+    return { success: true as const };
+  }
+
+  rejoinPlayer(pin: string, playerId: string, token: string, socketId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
+    const player = t.players.find((p) => p.id === playerId && p.token === token);
+    if (!player || player.left) return fail('Tu sesión ya no es válida.');
+    if (t.bannedPlayerIds.includes(player.id)) {
+      return fail('Has sido expulsado del torneo.');
+    }
+    player.socketId = socketId;
+    player.connected = true;
+    this.scheduleSave();
+    return { success: true as const, player };
   }
 
   // =========================================================
   // JUGADORES
   // =========================================================
 
-  addPlayer(
-    pin: string,
-    data: {
-      id: string;
-      nickname: string;
-    },
-  ) {
-    const tournament = this.getTournament(pin);
+  addPlayer(pin: string, rawNickname: string, socketId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
+    const nickname = (rawNickname ?? '').trim().slice(0, MAX_NICK);
+    if (!nickname) return fail('Debes introducir un apodo.');
 
-    if (tournament.status !== 'LOBBY') {
-      return {
-        success: false,
-        error: 'El torneo ya ha comenzado.',
-      };
-    }
-
-    const nickname = data.nickname.trim();
-
-    if (!nickname) {
-      return {
-        success: false,
-        error: 'Debes introducir un apodo.',
-      };
-    }
-
-    const normalized = nickname.toLowerCase();
-
-    if (
-      tournament.bannedNicknames.includes(
-        normalized,
-      )
-    ) {
-      return {
-        success: false,
-        error: 'Ese jugador ha sido expulsado del torneo.',
-      };
-    }
-
-    const exists = tournament.players.some(
-      (player) =>
-        !player.left &&
-        player.nickname.toLowerCase() === normalized,
+    const key = nickname.toLowerCase();
+    const same = t.players.find(
+      (p) => !p.left && p.nickname.toLowerCase() === key,
     );
 
-    if (exists) {
-      return {
-        success: false,
-        error: 'Ese apodo ya está ocupado.',
-      };
+    // Doble toque en "Unirse": mismo socket y mismo apodo -> es idempotente.
+    if (same && same.socketId === socketId) {
+      return { success: true as const, player: same };
     }
 
+    if (t.status !== 'LOBBY') return fail('El torneo ya ha comenzado.');
+    if (t.bannedNicknames.includes(key)) {
+      return fail('Ese jugador ha sido expulsado del torneo.');
+    }
+    if (same) return fail('Ese apodo ya está ocupado.');
+
     const player: Player = {
-      id: data.id,
+      id: newId(),
+      token: newToken(),
       nickname,
+      socketId,
+      connected: true,
       left: false,
+      seed: Math.random(),
     };
 
-    tournament.players.push(player);
+    t.players.push(player);
+    this.scheduleSave();
+    return { success: true as const, player };
+  }
 
-    this.save();
+  /** Salida voluntaria, desconexión prolongada o expulsión. */
+  removePlayer(pin: string, playerId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    return {
-      success: true,
-      player,
-    };
+    const player = this.getPlayer(t, playerId);
+    if (!player) return fail('Jugador no encontrado.');
+
+    if (t.status === 'LOBBY') {
+      t.players = t.players.filter((p) => p.id !== playerId);
+    } else {
+      player.left = true;
+      player.connected = false;
+      player.socketId = null;
+      this.resolveLeftMatches(t);
+      this.progress(t);
+    }
+
+    this.scheduleSave();
+    return { success: true as const, player };
+  }
+
+  kickPlayer(pin: string, playerId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
+
+    const player = this.getPlayer(t, playerId);
+    if (!player) return fail('Jugador no encontrado.');
+
+    if (!t.bannedPlayerIds.includes(player.id)) t.bannedPlayerIds.push(player.id);
+
+    const nick = player.nickname.toLowerCase();
+    if (!t.bannedNicknames.includes(nick)) t.bannedNicknames.push(nick);
+
+    return this.removePlayer(pin, playerId);
   }
 
   // =========================================================
   // JUEGOS
   // =========================================================
 
-  addGame(
-    pin: string,
-    game: string,
-  ) {
-    const tournament = this.getTournament(pin);
+  addGame(pin: string, game: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
+    const clean = (game ?? '').trim().slice(0, MAX_GAME);
+    if (!clean) return fail('El nombre del juego está vacío.');
+
+    if (t.games.some((g) => g.toLowerCase() === clean.toLowerCase())) {
+      return fail('Ese juego ya existe.');
     }
 
-    const cleanGame = game?.trim();
-
-    if (!cleanGame) {
-      return {
-        success: false,
-        error: 'El nombre del juego está vacío.',
-      };
-    }
-
-    const exists = tournament.games.some(
-      (item) =>
-        item.toLowerCase() ===
-        cleanGame.toLowerCase(),
-    );
-
-    if (exists) {
-      return {
-        success: false,
-        error: 'Ese juego ya existe.',
-      };
-    }
-
-    tournament.games.push(cleanGame);
-
-    this.save();
-
-    return {
-      success: true,
-      games: tournament.games,
-    };
+    t.games.push(clean);
+    this.scheduleSave();
+    return { success: true as const, games: t.games };
   }
 
-  removeGame(
-    pin: string,
-    game: string,
-  ) {
-    const tournament = this.getTournament(pin);
+  removeGame(pin: string, game: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
+    const index = t.games.indexOf(game);
+    if (index === -1) return fail('Juego no encontrado.');
 
-    const index = tournament.games.findIndex(
-      (item) => item === game,
-    );
-
-    if (index === -1) {
-      return {
-        success: false,
-        error: 'Juego no encontrado.',
-      };
-    }
-
-    tournament.games.splice(index, 1);
-
-    this.save();
-
-    return {
-      success: true,
-      games: tournament.games,
-    };
+    t.games.splice(index, 1);
+    this.scheduleSave();
+    return { success: true as const, games: t.games };
   }
 
-  spinGame(pin: string) {
-    const tournament = this.getTournament(pin);
+  assignGame(pin: string, matchId: string, game: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
-
-    if (tournament.games.length === 0) {
-      return {
-        success: false,
-        error: 'No hay juegos disponibles.',
-      };
-    }
-
-    const game =
-      tournament.games[
-        Math.floor(
-          Math.random() *
-            tournament.games.length,
-        )
-      ];
-
-    return {
-      success: true,
-      game,
-    };
-  }
-
-  assignGame(
-    pin: string,
-    matchId: string,
-    game: string,
-  ) {
-    const tournament = this.getTournament(pin);
-
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
-
-    const match = this.getMatch(
-      tournament,
-      matchId,
-    );
-
-    if (!match) {
-      return {
-        success: false,
-        error: 'Partido no encontrado.',
-      };
-    }
-
-    if (match.played) {
-      return {
-        success: false,
-        error: 'El partido ya ha terminado.',
-      };
-    }
-
-    if (!tournament.games.includes(game)) {
-      return {
-        success: false,
-        error: 'Ese juego no está disponible.',
-      };
-    }
+    const match = this.getMatch(t, matchId);
+    if (!match) return fail('Partido no encontrado.');
+    if (match.played) return fail('El partido ya ha terminado.');
+    if (!t.games.includes(game)) return fail('Ese juego no está disponible.');
 
     match.game = game;
+    this.scheduleSave();
+    return { success: true as const, game };
+  }
 
-    this.save();
+  /** Vuelve a sortear el juego de un partido (distinto al actual). */
+  rerollGame(pin: string, matchId: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    return {
-      success: true,
-      match,
-    };
+    const match = this.getMatch(t, matchId);
+    if (!match) return fail('Partido no encontrado.');
+    if (match.played) return fail('El partido ya ha terminado.');
+
+    const game = this.pickGame(t, match.player1Id, match.player2Id, match.game);
+    if (!game) return fail('No hay juegos disponibles.');
+
+    match.game = game;
+    this.scheduleSave();
+    return { success: true as const, game };
+  }
+
+  /**
+   * Elige un juego al azar evitando los que ya han jugado los dos rivales
+   * y prefiriendo los menos usados en todo el torneo.
+   */
+  private pickGame(
+    t: Tournament,
+    player1Id: string,
+    player2Id: string,
+    avoid: string | null = null,
+  ): string | null {
+    if (t.games.length === 0) return null;
+
+    const usedByThem = new Set<string>();
+    const usage = new Map<string, number>();
+
+    for (const m of t.matches) {
+      if (!m.game) continue;
+      usage.set(m.game, (usage.get(m.game) ?? 0) + 1);
+      const theirs = [m.player1Id, m.player2Id];
+      if (theirs.includes(player1Id) || theirs.includes(player2Id)) {
+        usedByThem.add(m.game);
+      }
+    }
+
+    let pool = t.games.filter((g) => !usedByThem.has(g) && g !== avoid);
+    if (pool.length === 0) pool = t.games.filter((g) => g !== avoid);
+    if (pool.length === 0) pool = [...t.games];
+
+    const min = Math.min(...pool.map((g) => usage.get(g) ?? 0));
+    const best = pool.filter((g) => (usage.get(g) ?? 0) === min);
+    return best[Math.floor(Math.random() * best.length)];
   }
 
   // =========================================================
-  // PLAN DE TORNEO
+  // PLAN DEL TORNEO
   // =========================================================
 
-  getBracketPlan(
-    n: number,
-  ): BracketPlan {
+  getBracketPlan(n: number): BracketPlan {
     if (n < 2) {
       return {
         bracketSize: 0,
@@ -478,1268 +525,464 @@ export class TournamentService {
     }
 
     let bracketSize = 2;
+    while (bracketSize * 2 <= n) bracketSize *= 2;
 
-    while (
-      bracketSize * 2 <= n
-    ) {
-      bracketSize *= 2;
-    }
-
-    let direct = Math.ceil(
-      bracketSize / 2,
-    );
-
-    let repSlots =
-      bracketSize - direct;
-
-    let repPlayers =
-      repSlots * 2;
-
-    let totalNeeded =
-      direct + repPlayers;
-
-    while (
-      totalNeeded > n &&
-      bracketSize > 2
-    ) {
-      bracketSize /= 2;
-
-      direct = Math.ceil(
-        bracketSize / 2,
-      );
-
-      repSlots =
-        bracketSize - direct;
-
-      repPlayers =
-        repSlots * 2;
-
-      totalNeeded =
-        direct + repPlayers;
-    }
-
-    if (totalNeeded > n) {
-      repSlots = 0;
-      repPlayers = 0;
-
-      direct = Math.min(
-        bracketSize,
-        n,
-      );
-
-      totalNeeded = direct;
-    }
-
-    const out = Math.max(
-      0,
-      n - totalNeeded,
-    );
-
-    return {
-      bracketSize,
-      direct,
-      repSlots,
-      repPlayers,
-      out,
-      totalNeeded,
+    const calc = (size: number) => {
+      const direct = Math.ceil(size / 2);
+      const repSlots = size - direct;
+      return {
+        direct,
+        repSlots,
+        repPlayers: repSlots * 2,
+        totalNeeded: direct + repSlots * 2,
+      };
     };
+
+    let c = calc(bracketSize);
+
+    while (c.totalNeeded > n && bracketSize > 2) {
+      bracketSize /= 2;
+      c = calc(bracketSize);
+    }
+
+    if (c.totalNeeded > n) {
+      const direct = Math.min(bracketSize, n);
+      c = { direct, repSlots: 0, repPlayers: 0, totalNeeded: direct };
+    }
+
+    return { bracketSize, ...c, out: Math.max(0, n - c.totalNeeded) };
   }
 
-  private roundName(
-    size: number,
-  ): string {
-    if (size === 2) return 'GRAN FINAL';
-
+  private roundName(size: number): string {
+    if (size <= 2) return 'GRAN FINAL';
     if (size === 4) return 'SEMIFINAL';
-
     if (size === 8) return 'CUARTOS DE FINAL';
-
     if (size === 16) return 'OCTAVOS DE FINAL';
-
-    if (size === 32) {
-      return 'DIECISEISAVOS DE FINAL';
-    }
-
+    if (size === 32) return 'DIECISEISAVOS DE FINAL';
     return `RONDA DE ${size}`;
   }
 
   // =========================================================
-  // CREAR PARTIDO
+  // PARTIDOS
   // =========================================================
 
   private createMatch(
-    tournament: Tournament,
+    t: Tournament,
     stage: MatchStage,
     round: number,
     player1Id: string,
     player2Id: string,
+    slot?: number,
   ): Match {
     const match: Match = {
-      id: `${tournament.pin}-${++tournament.sequence}`,
-
+      id: `${t.pin}-${++t.sequence}`,
       stage,
-
       round,
-
+      slot,
       player1Id,
-
       player2Id,
-
       score1: 0,
-
       score2: 0,
-
       winnerId: null,
-
-      game: null,
-
+      game: this.pickGame(t, player1Id, player2Id),
       played: false,
-
       forfeit: false,
-
       playedAt: null,
-
-      roundName:
-        stage === 'eliminatoria'
-          ? this.roundName(
-              this.getExpectedRoundSize(
-                tournament,
-                round,
-              ),
-            )
-          : undefined,
     };
 
-    tournament.matches.push(match);
-
+    t.matches.push(match);
     return match;
-  }
-
-  private getExpectedRoundSize(
-    tournament: Tournament,
-    round: number,
-  ): number {
-    const eliminationMatches =
-      tournament.matches.filter(
-        (match) =>
-          match.stage === 'eliminatoria' &&
-          match.round === round,
-      );
-
-    return eliminationMatches.length * 2;
   }
 
   // =========================================================
   // CLASIFICACIÓN
   // =========================================================
 
-  generateClassification(
-    tournament: Tournament,
-  ): Match[] {
-    tournament.matches = [];
-
-    tournament.sequence = 0;
-
-    tournament.bracketRound = 0;
-
-    tournament.champion = null;
-
-    tournament.status =
-      'CLASIFICACION';
-
-    const players =
-      this.shuffle(
-        this.getActivePlayers(tournament),
-      );
-
-    if (players.length < 2) {
-      this.save();
-
-      return [];
+  startTournament(pin: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
+    if (t.status !== 'LOBBY') return fail('El torneo ya ha comenzado.');
+    if (this.getActivePlayers(t).length < 2) {
+      return fail('Se necesitan al menos 2 jugadores.');
     }
 
-    let list = [...players];
+    this.generateClassification(t);
+    this.scheduleSave();
+    return { success: true as const };
+  }
 
-    if (list.length % 2 !== 0) {
-      list.push(null as any);
-    }
+  private generateClassification(t: Tournament): void {
+    t.matches = [];
+    t.sequence = 0;
+    t.bracketRound = 0;
+    t.roundSlots = [];
+    t.frozenStandings = null;
+    t.champion = null;
+    t.status = 'CLASIFICACION';
 
-    const rounds: Match[][] = [];
+    let list: (Player | null)[] = this.shuffle(this.getActivePlayers(t));
+    if (list.length % 2 !== 0) list.push(null);
 
-    const totalRounds =
-      Math.min(
-        3,
-        list.length - 1,
-      );
+    const totalRounds = Math.min(3, list.length - 1);
 
-    for (
-      let round = 0;
-      round < totalRounds;
-      round++
-    ) {
-      const roundMatches: Match[] = [];
-
-      for (
-        let i = 0;
-        i < list.length / 2;
-        i++
-      ) {
-        const player1 =
-          list[i];
-
-        const player2 =
-          list[
-            list.length - 1 - i
-          ];
-
-        if (
-          player1 &&
-          player2
-        ) {
-          const match =
-            this.createMatch(
-              tournament,
-              'clasificacion',
-              round + 1,
-              player1.id,
-              player2.id,
-            );
-
-          roundMatches.push(match);
-        }
+    for (let round = 1; round <= totalRounds; round++) {
+      for (let i = 0; i < list.length / 2; i++) {
+        const a = list[i];
+        const b = list[list.length - 1 - i];
+        if (a && b) this.createMatch(t, 'clasificacion', round, a.id, b.id);
       }
 
-      rounds.push(roundMatches);
-
-      const fixed = list[0];
-
-      const rest = list.slice(1);
-
-      rest.unshift(
-        rest.pop()!,
-      );
-
-      list = [
-        fixed,
-        ...rest,
-      ];
+      // Método del círculo: el primero queda fijo y el resto rota.
+      const [fixed, ...rest] = list;
+      rest.unshift(rest.pop() as Player | null);
+      list = [fixed, ...rest];
     }
-
-    this.save();
-
-    return rounds.flat();
   }
 
-  // =========================================================
-  // CLASIFICACIÓN / STANDINGS
-  // =========================================================
-
-  getStandings(
-    tournament: Tournament,
-  ): Standing[] {
-    const players =
-      this.getActivePlayers(
-        tournament,
-      );
-
-    const plan =
-      this.getBracketPlan(
-        players.length,
-      );
-
-    const standings =
-      players.map(
-        (player, index) => {
-          const matches =
-            tournament.matches.filter(
-              (match) =>
-                match.stage ===
-                  'clasificacion' &&
-                match.played &&
-                (
-                  match.player1Id ===
-                    player.id ||
-                  match.player2Id ===
-                    player.id
-                ),
-            );
-
-          let wins = 0;
-          let losses = 0;
-          let scoreFor = 0;
-          let scoreAgainst = 0;
-
-          for (
-            const match of matches
-          ) {
-            const isPlayer1 =
-              match.player1Id ===
-              player.id;
-
-            const ownScore =
-              isPlayer1
-                ? match.score1
-                : match.score2;
-
-            const opponentScore =
-              isPlayer1
-                ? match.score2
-                : match.score1;
-
-            scoreFor += ownScore;
-
-            scoreAgainst +=
-              opponentScore;
-
-            if (
-              match.winnerId ===
-              player.id
-            ) {
-              wins++;
-            } else {
-              losses++;
-            }
-          }
-
-          return {
-            position: 0,
-
-            player,
-
-            played:
-              matches.length,
-
-            wins,
-
-            losses,
-
-            scoreFor,
-
-            scoreAgainst,
-
-            roundDifference:
-              scoreFor -
-              scoreAgainst,
-
-            zone: 'fuera' as const,
-
-            originalIndex: index,
-          };
-        },
-      );
-
-    standings.sort(
-      (a: any, b: any) => {
-        if (b.wins !== a.wins) {
-          return b.wins - a.wins;
-        }
-
-        if (
-          b.roundDifference !==
-          a.roundDifference
-        ) {
-          return (
-            b.roundDifference -
-            a.roundDifference
-          );
-        }
-
-        if (
-          b.scoreFor !==
-          a.scoreFor
-        ) {
-          return (
-            b.scoreFor -
-            a.scoreFor
-          );
-        }
-
-        return (
-          a.originalIndex -
-          b.originalIndex
-        );
-      },
+  private computeStandings(t: Tournament): Standing[] {
+    const players = this.getActivePlayers(t);
+    const plan = this.getBracketPlan(players.length);
+    const played = t.matches.filter(
+      (m) => m.stage === 'clasificacion' && m.played && m.winnerId,
     );
 
-    standings.forEach(
-      (standing: any, index) => {
-        standing.position =
-          index + 1;
+    const rows = players.map((player) => {
+      let wins = 0;
+      let losses = 0;
+      let scoreFor = 0;
+      let scoreAgainst = 0;
 
-        if (
-          index < plan.direct
-        ) {
-          standing.zone =
-            'directo';
-        } else if (
-          index <
-          plan.direct +
-            plan.repPlayers
-        ) {
-          standing.zone =
-            'repesca';
-        } else {
-          standing.zone =
-            'fuera';
-        }
+      for (const m of played) {
+        const isP1 = m.player1Id === player.id;
+        const isP2 = m.player2Id === player.id;
+        if (!isP1 && !isP2) continue;
 
-        delete standing.originalIndex;
-      },
+        scoreFor += isP1 ? m.score1 : m.score2;
+        scoreAgainst += isP1 ? m.score2 : m.score1;
+        if (m.winnerId === player.id) wins++;
+        else losses++;
+      }
+
+      return { player, wins, losses, scoreFor, scoreAgainst };
+    });
+
+    const headToHead = (a: string, b: string) => {
+      const m = played.find(
+        (x) =>
+          (x.player1Id === a && x.player2Id === b) ||
+          (x.player1Id === b && x.player2Id === a),
+      );
+      if (!m) return 0;
+      return m.winnerId === a ? -1 : 1;
+    };
+
+    // Porcentaje de victorias primero: quien descansa una ronda no sale perjudicado.
+    const rate = (r: { wins: number; losses: number }) => {
+      const total = r.wins + r.losses;
+      return total ? r.wins / total : 0;
+    };
+
+    rows.sort(
+      (a, b) =>
+        rate(b) - rate(a) ||
+        b.wins - a.wins ||
+        b.scoreFor - b.scoreAgainst - (a.scoreFor - a.scoreAgainst) ||
+        b.scoreFor - a.scoreFor ||
+        headToHead(a.player.id, b.player.id) ||
+        a.player.seed - b.player.seed,
     );
 
-    return standings;
+    return rows.map((r, index) => ({
+      position: index + 1,
+      player: this.pub(r.player),
+      played: r.wins + r.losses,
+      wins: r.wins,
+      losses: r.losses,
+      scoreFor: r.scoreFor,
+      scoreAgainst: r.scoreAgainst,
+      roundDifference: r.scoreFor - r.scoreAgainst,
+      zone:
+        index < plan.direct
+          ? 'directo'
+          : index < plan.direct + plan.repPlayers
+            ? 'repesca'
+            : 'fuera',
+    }));
   }
 
-  // =========================================================
-  // CERRAR CLASIFICACIÓN
-  // =========================================================
+  getStandings(t: Tournament): Standing[] {
+    return t.frozenStandings ?? this.computeStandings(t);
+  }
 
-  lockClassification(
-    pin: string,
-  ) {
-    const tournament =
-      this.getTournament(pin);
-
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
+  lockClassification(pin: string) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
+    if (t.status !== 'CLASIFICACION') {
+      return fail('La clasificación ya está cerrada.');
     }
 
-    if (
-      tournament.status !==
-      'CLASIFICACION'
-    ) {
-      return {
-        success: false,
-        error:
-          'La clasificación ya está cerrada.',
-      };
+    const pending = t.matches.some(
+      (m) => m.stage === 'clasificacion' && !m.played,
+    );
+    if (pending) {
+      return fail('Todavía quedan partidos de clasificación sin resultado.');
     }
 
-    const classificationMatches =
-      tournament.matches.filter(
-        (match) =>
-          match.stage ===
-          'clasificacion',
-      );
+    // Se congela la tabla: a partir de aquí las salidas ya no cambian las zonas.
+    const standings = this.computeStandings(t);
+    t.frozenStandings = standings;
 
-    const unfinished =
-      classificationMatches.some(
-        (match) => !match.played,
-      );
+    const direct = standings
+      .filter((s) => s.zone === 'directo')
+      .map((s) => s.player.id);
+    const rep = standings
+      .filter((s) => s.zone === 'repesca')
+      .map((s) => s.player.id);
 
-    if (unfinished) {
-      return {
-        success: false,
-        error:
-          'Todavía quedan partidos de clasificación sin resultado.',
-      };
-    }
-
-    const standings =
-      this.getStandings(
-        tournament,
-      );
-
-    const plan =
-      this.getBracketPlan(
-        standings.length,
-      );
-
-    const direct =
-      standings.slice(
-        0,
-        plan.direct,
-      );
-
-    const repechagePlayers =
-      standings.slice(
-        plan.direct,
-        plan.direct +
-          plan.repPlayers,
-      );
-
-    tournament.matches =
-      tournament.matches.filter(
-        (match) =>
-          match.stage !==
-          'repesca',
-      );
-
-    if (
-      repechagePlayers.length === 0
-    ) {
-      tournament.status =
-        'ELIMINATORIA';
-
+    if (rep.length < 2) {
+      t.status = 'ELIMINATORIA';
+      const size = this.nextPow2(direct.length);
       this.startEliminationRound(
-        tournament,
-        direct.map(
-          (standing) =>
-            standing.player.id,
-        ),
+        t,
+        this.bracketOrder(size).map((seed) => direct[seed - 1] ?? null),
       );
     } else {
-      tournament.status =
-        'REPESCA';
+      t.status = 'REPESCA';
+      // Mejor contra peor dentro de la zona de repesca.
+      for (let j = 0; j < Math.floor(rep.length / 2); j++) {
+        this.createMatch(t, 'repesca', 1, rep[j], rep[rep.length - 1 - j]);
+      }
+      this.resolveLeftMatches(t);
+      this.progress(t);
+    }
 
-      for (
-        let i = 0;
-        i <
-        repechagePlayers.length;
-        i += 2
-      ) {
-        const player1 =
-          repechagePlayers[i];
+    this.scheduleSave();
+    return { success: true as const };
+  }
 
-        const player2 =
-          repechagePlayers[i + 1];
+  // =========================================================
+  // REPESCA Y ELIMINATORIA
+  // =========================================================
 
-        if (
-          !player1 ||
-          !player2
-        ) {
-          continue;
-        }
+  private progress(t: Tournament): void {
+    if (t.status === 'REPESCA') this.tryStartElimination(t);
+    else if (t.status === 'ELIMINATORIA') this.tryAdvanceElimination(t);
+  }
 
-        this.createMatch(
-          tournament,
-          'repesca',
-          1,
-          player1.player.id,
-          player2.player.id,
-        );
+  private tryStartElimination(t: Tournament): void {
+    if (t.status !== 'REPESCA') return;
+
+    const repMatches = t.matches.filter((m) => m.stage === 'repesca');
+    if (repMatches.length === 0 || repMatches.some((m) => !m.played)) return;
+
+    const direct = (t.frozenStandings ?? [])
+      .filter((s) => s.zone === 'directo')
+      .map((s) => s.player.id);
+
+    // Los cabezas de serie directos ocupan las primeras plazas;
+    // el ganador de la repesca "j" ocupa la plaza direct + j + 1.
+    const size = this.nextPow2(direct.length + repMatches.length);
+    const slots = this.bracketOrder(size).map((seed) =>
+      seed <= direct.length
+        ? direct[seed - 1]
+        : (repMatches[seed - direct.length - 1]?.winnerId ?? null),
+    );
+
+    t.status = 'ELIMINATORIA';
+    this.startEliminationRound(t, slots);
+  }
+
+  private startEliminationRound(t: Tournament, slots: (string | null)[]): void {
+    t.bracketRound++;
+    t.roundSlots = slots;
+
+    const name = this.roundName(this.nextPow2(slots.length));
+
+    for (let p = 0; p < slots.length; p += 2) {
+      const a = slots[p];
+      const b = slots[p + 1] ?? null;
+      if (a && b) {
+        const match = this.createMatch(t, 'eliminatoria', t.bracketRound, a, b, p / 2);
+        match.roundName = name;
       }
     }
 
-    this.save();
+    this.resolveLeftMatches(t);
+    this.tryAdvanceElimination(t);
+  }
 
-    return {
-      success: true,
+  private tryAdvanceElimination(t: Tournament): void {
+    if (t.status !== 'ELIMINATORIA') return;
 
-      snapshot:
-        this.getSnapshot(pin),
+    const round = t.bracketRound;
+    const roundMatches = t.matches.filter(
+      (m) => m.stage === 'eliminatoria' && m.round === round,
+    );
+    if (roundMatches.some((m) => !m.played)) return;
+
+    const slots = t.roundSlots;
+    const next: (string | null)[] = [];
+
+    for (let p = 0; p < slots.length; p += 2) {
+      const a = slots[p];
+      const b = slots[p + 1] ?? null;
+      let advances: string | null = null;
+
+      if (a && b) {
+        advances = roundMatches.find((m) => m.slot === p / 2)?.winnerId ?? null;
+      } else {
+        // Pase directo (bye), salvo que ese jugador ya se haya ido.
+        const only = a ?? b;
+        const gone = only ? !!this.getPlayer(t, only)?.left : true;
+        advances = only && !gone ? only : null;
+      }
+
+      next.push(advances);
+    }
+
+    const alive = next.filter((id): id is string => !!id);
+
+    if (alive.length <= 1) {
+      t.champion = alive[0] ?? null;
+      t.status = 'FINISHED';
+      return;
+    }
+
+    this.startEliminationRound(t, next.length % 2 ? [...next, null] : next);
+  }
+
+  /** Da por perdidos (forfait) los partidos pendientes con jugadores que ya no están. */
+  private resolveLeftMatches(t: Tournament): void {
+    const gone = (id: string) => {
+      const p = this.getPlayer(t, id);
+      return !p || p.left;
     };
-  }
 
-  // =========================================================
-  // REPESCA
-  // =========================================================
+    for (const m of t.matches) {
+      if (m.played) continue;
 
-  private tryStartElimination(
-    tournament: Tournament,
-  ): void {
-    const repechageMatches =
-      tournament.matches.filter(
-        (match) =>
-          match.stage ===
-          'repesca',
-      );
+      const g1 = gone(m.player1Id);
+      const g2 = gone(m.player2Id);
+      if (!g1 && !g2) continue;
 
-    if (
-      repechageMatches.length === 0
-    ) {
-      return;
-    }
+      m.played = true;
+      m.forfeit = true;
+      m.playedAt = Date.now();
+      m.game = m.game ?? t.games[0] ?? null;
 
-    if (
-      repechageMatches.some(
-        (match) =>
-          !match.played,
-      )
-    ) {
-      return;
-    }
-
-    const standings =
-      this.getStandings(
-        tournament,
-      );
-
-    const plan =
-      this.getBracketPlan(
-        standings.length,
-      );
-
-    const direct =
-      standings
-        .slice(
-          0,
-          plan.direct,
-        )
-        .map(
-          (standing) =>
-            standing.player.id,
-        );
-
-    const repechageWinners =
-      repechageMatches
-        .map(
-          (match) =>
-            match.winnerId,
-        )
-        .filter(
-          (
-            id,
-          ): id is string =>
-            !!id,
-        );
-
-    const order: string[] = [];
-
-    for (
-      let i = 0;
-      i < direct.length;
-      i++
-    ) {
-      order.push(
-        direct[i],
-      );
-
-      const winner =
-        repechageWinners[
-          repechageWinners.length -
-            1 -
-            i
-        ];
-
-      if (winner) {
-        order.push(winner);
+      if (g1 && g2) {
+        m.winnerId = null;
+        m.score1 = 0;
+        m.score2 = 0;
+      } else if (g1) {
+        m.winnerId = m.player2Id;
+        m.score1 = 0;
+        m.score2 = 2;
+      } else {
+        m.winnerId = m.player1Id;
+        m.score1 = 2;
+        m.score2 = 0;
       }
     }
-
-    tournament.status =
-      'ELIMINATORIA';
-
-    this.startEliminationRound(
-      tournament,
-      order,
-    );
-  }
-
-  // =========================================================
-  // ELIMINATORIA
-  // =========================================================
-
-  private startEliminationRound(
-    tournament: Tournament,
-    playerIds: string[],
-  ): void {
-    if (playerIds.length < 2) {
-      if (playerIds.length === 1) {
-        tournament.champion =
-          playerIds[0];
-
-        tournament.status =
-          'FINISHED';
-      }
-
-      return;
-    }
-
-    tournament.bracketRound++;
-
-    const round =
-      tournament.bracketRound;
-
-    const bracketSize =
-      playerIds.length;
-
-    for (
-      let i = 0;
-      i <
-      playerIds.length;
-      i += 2
-    ) {
-      const player1 =
-        playerIds[i];
-
-      const player2 =
-        playerIds[i + 1];
-
-      if (
-        !player1 ||
-        !player2
-      ) {
-        continue;
-      }
-
-      const match =
-        this.createMatch(
-          tournament,
-          'eliminatoria',
-          round,
-          player1,
-          player2,
-        );
-
-      match.roundName =
-        this.roundName(
-          bracketSize,
-        );
-    }
-  }
-
-  private tryAdvanceElimination(
-    tournament: Tournament,
-  ): void {
-    const currentRound =
-      tournament.bracketRound;
-
-    const matches =
-      tournament.matches.filter(
-        (match) =>
-          match.stage ===
-            'eliminatoria' &&
-          match.round ===
-            currentRound,
-      );
-
-    if (
-      matches.length === 0
-    ) {
-      return;
-    }
-
-    if (
-      matches.some(
-        (match) =>
-          !match.played,
-      )
-    ) {
-      return;
-    }
-
-    const winners =
-      matches
-        .map(
-          (match) =>
-            match.winnerId,
-        )
-        .filter(
-          (
-            id,
-          ): id is string =>
-            !!id,
-        );
-
-    if (
-      winners.length === 1
-    ) {
-      tournament.champion =
-        winners[0];
-
-      tournament.status =
-        'FINISHED';
-
-      this.save();
-
-      return;
-    }
-
-    this.startEliminationRound(
-      tournament,
-      winners,
-    );
   }
 
   // =========================================================
   // RESULTADOS
   // =========================================================
 
-  setMatchResult(
-    pin: string,
-    matchId: string,
-    score1: number,
-    score2: number,
-  ) {
-    const tournament =
-      this.getTournament(pin);
+  setMatchResult(pin: string, matchId: string, score1: number, score2: number) {
+    const t = this.getTournament(pin);
+    if (!t) return fail('Torneo no encontrado.');
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
-
-    const match =
-      this.getMatch(
-        tournament,
-        matchId,
-      );
-
-    if (!match) {
-      return {
-        success: false,
-        error: 'Partido no encontrado.',
-      };
-    }
-
-    if (match.played) {
-      return {
-        success: false,
-        error:
-          'Este partido ya ha terminado.',
-      };
-    }
-
+    const match = this.getMatch(t, matchId);
+    if (!match) return fail('Partido no encontrado.');
+    if (match.played) return fail('Este partido ya ha terminado.');
     if (!match.game) {
-      return {
-        success: false,
-        error:
-          'Primero debes asignar un juego al partido.',
-      };
+      return fail('Primero debes asignar un juego al partido.');
     }
 
-    if (
-      !Number.isInteger(score1) ||
-      !Number.isInteger(score2) ||
-      score1 < 0 ||
-      score2 < 0 ||
-      score1 > 2 ||
-      score2 > 2
-    ) {
-      return {
-        success: false,
-        error:
-          'El marcador debe estar entre 0 y 2.',
-      };
+    const valid = (n: number) => Number.isInteger(n) && n >= 0 && n <= 2;
+    if (!valid(score1) || !valid(score2)) {
+      return fail('El marcador debe estar entre 0 y 2.');
     }
+    if (score1 === score2) return fail('No puede haber empate.');
+    if (score1 !== 2 && score2 !== 2) return fail('Un jugador debe llegar a 2.');
 
-    if (score1 === score2) {
-      return {
-        success: false,
-        error:
-          'No puede haber empate.',
-      };
-    }
-
-    if (
-      score1 !== 2 &&
-      score2 !== 2
-    ) {
-      return {
-        success: false,
-        error:
-          'Un jugador debe llegar a 2.',
-      };
-    }
-
-    match.score1 =
-      score1;
-
-    match.score2 =
-      score2;
-
-    match.winnerId =
-      score1 > score2
-        ? match.player1Id
-        : match.player2Id;
-
+    match.score1 = score1;
+    match.score2 = score2;
+    match.winnerId = score1 > score2 ? match.player1Id : match.player2Id;
     match.played = true;
-
     match.forfeit = false;
+    match.playedAt = Date.now();
 
-    match.playedAt =
-      Date.now();
+    this.progress(t);
+    this.scheduleSave();
 
-    if (
-      match.stage ===
-      'repesca'
-    ) {
-      this.tryStartElimination(
-        tournament,
-      );
-    }
-
-    if (
-      match.stage ===
-      'eliminatoria'
-    ) {
-      this.tryAdvanceElimination(
-        tournament,
-      );
-    }
-
-    this.save();
-
-    return {
-      success: true,
-
-      isFinished:
-        tournament.status ===
-        'FINISHED',
-
-      snapshot:
-        this.getSnapshot(pin),
-    };
+    return { success: true as const, finished: t.status === 'FINISHED' };
   }
 
   // =========================================================
-  // EXPULSAR / SALIR
+  // SNAPSHOT Y ESTADO INDIVIDUAL
   // =========================================================
 
-  removePlayer(
-    pin: string,
-    playerId: string,
-  ) {
-    const tournament =
-      this.getTournament(pin);
+  getSnapshot(pin: string): TournamentSnapshot | null {
+    const t = this.getTournament(pin);
+    if (!t) return null;
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
-
-    const player =
-      this.getPlayer(
-        tournament,
-        playerId,
-      );
-
-    if (!player) {
-      return {
-        success: false,
-        error:
-          'Jugador no encontrado.',
-      };
-    }
-
-    if (
-      tournament.status ===
-      'LOBBY'
-    ) {
-      tournament.players =
-        tournament.players.filter(
-          (item) =>
-            item.id !== playerId,
-        );
-    } else {
-      player.left = true;
-
-      this.resolveForfeitMatches(
-        tournament,
-        playerId,
-      );
-    }
-
-    this.save();
+    const active = this.getActivePlayers(t);
 
     return {
-      success: true,
-      player,
+      pin: t.pin,
+      phase: t.status,
+      plan: this.getBracketPlan(active.length),
+      players: active.map((p) => this.pub(p)),
+      games: t.games,
+      matches: t.matches.map((m) => this.toSnapshotMatch(t, m)),
+      standings: this.getStandings(t),
+      champion: this.pubById(t, t.champion),
     };
   }
 
-  kickPlayer(
-    pin: string,
-    playerId: string,
-  ) {
-    const tournament =
-      this.getTournament(pin);
+  getPlayerHistory(pin: string, playerId: string): PlayerState | null {
+    const t = this.getTournament(pin);
+    if (!t) return null;
 
-    if (!tournament) {
-      return {
-        success: false,
-        error: 'Torneo no encontrado.',
-      };
-    }
+    const player = this.getPlayer(t, playerId);
+    if (!player) return null;
 
-    const player =
-      this.getPlayer(
-        tournament,
-        playerId,
-      );
-
-    if (!player) {
-      return {
-        success: false,
-        error:
-          'Jugador no encontrado.',
-      };
-    }
-
-    tournament.bannedPlayerIds.push(
-      player.id,
+    const mine = t.matches.filter(
+      (m) => m.player1Id === playerId || m.player2Id === playerId,
     );
 
-    const nickname =
-      player.nickname.toLowerCase();
+    const opponentOf = (m: Match) =>
+      m.player1Id === playerId ? m.player2Id : m.player1Id;
 
-    if (
-      !tournament.bannedNicknames.includes(
-        nickname,
-      )
-    ) {
-      tournament.bannedNicknames.push(
-        nickname,
-      );
-    }
+    const history: HistoryEntry[] = mine.map((m) => {
+      const isP1 = m.player1Id === playerId;
+      return {
+        matchId: m.id,
+        stage: m.stage,
+        roundName: m.roundName,
+        opponent: this.pubById(t, opponentOf(m)),
+        game: m.game,
+        myScore: isP1 ? m.score1 : m.score2,
+        opponentScore: isP1 ? m.score2 : m.score1,
+        result: !m.played ? 'pending' : m.winnerId === playerId ? 'win' : 'loss',
+        forfeit: m.forfeit,
+      };
+    });
 
-    return this.removePlayer(
-      pin,
-      playerId,
-    );
-  }
-
-  private resolveForfeitMatches(
-    tournament: Tournament,
-    playerId: string,
-  ): void {
-    const pending =
-      tournament.matches.filter(
-        (match) =>
-          !match.played &&
-          (
-            match.player1Id ===
-              playerId ||
-            match.player2Id ===
-              playerId
-          ),
-      );
-
-    for (
-      const match of pending
-    ) {
-      const winnerId =
-        match.player1Id ===
-        playerId
-          ? match.player2Id
-          : match.player1Id;
-
-      const winner =
-        this.getPlayer(
-          tournament,
-          winnerId,
-        );
-
-      if (
-        !winner ||
-        winner.left
-      ) {
-        continue;
-      }
-
-      match.winnerId =
-        winnerId;
-
-      if (
-        match.player1Id ===
-        winnerId
-      ) {
-        match.score1 = 2;
-        match.score2 = 0;
-      } else {
-        match.score1 = 0;
-        match.score2 = 2;
-      }
-
-      match.played = true;
-
-      match.forfeit = true;
-
-      match.playedAt =
-        Date.now();
-
-      if (!match.game) {
-        match.game =
-          tournament.games[0] ??
-          null;
-      }
-    }
-
-    const hasRepesca =
-      tournament.matches.some(
-        (match) =>
-          match.stage ===
-          'repesca',
-      );
-
-    const hasEliminatoria =
-      tournament.matches.some(
-        (match) =>
-          match.stage ===
-          'eliminatoria',
-      );
-
-    if (
-      tournament.status ===
-      'REPESCA' &&
-      hasRepesca
-    ) {
-      this.tryStartElimination(
-        tournament,
-      );
-    }
-
-    if (
-      tournament.status ===
-      'ELIMINATORIA' &&
-      hasEliminatoria
-    ) {
-      this.tryAdvanceElimination(
-        tournament,
-      );
-    }
-  }
-
-  // =========================================================
-  // SNAPSHOT
-  // =========================================================
-
-  getSnapshot(
-    pin: string,
-  ): TournamentSnapshot | null {
-    const tournament =
-      this.getTournament(pin);
-
-    if (!tournament) {
-      return null;
-    }
-
-    const players =
-      this.getActivePlayers(
-        tournament,
-      );
-
-    const standings =
-      this.getStandings(
-        tournament,
-      );
-
-    const plan =
-      this.getBracketPlan(
-        players.length,
-      );
-
-    const champion =
-      tournament.champion
-        ? this.getPlayer(
-            tournament,
-            tournament.champion,
-          ) ?? null
-        : null;
+    const current = mine.find((m) => !m.played) ?? null;
+    const standing = this.getStandings(t).find((s) => s.player.id === playerId);
 
     return {
-      pin:
-
-        tournament.pin,
-
-      phase:
-        tournament.status,
-
-      plan,
-
-      players,
-
-      games:
-        tournament.games,
-
-      matches:
-        tournament.matches,
-
-      standings,
-
-      champion,
-    };
-  }
-
-  // =========================================================
-  // ESTADO INDIVIDUAL
-  // =========================================================
-
-  getPlayerHistory(
-    pin: string,
-    playerId: string,
-  ): PlayerState | null {
-    const tournament =
-      this.getTournament(pin);
-
-    if (!tournament) {
-      return null;
-    }
-
-    const player =
-      this.getPlayer(
-        tournament,
-        playerId,
-      );
-
-    if (!player) {
-      return null;
-    }
-
-    const history =
-      this.getPlayerMatches(
-        tournament,
-        playerId,
-      );
-
-    const currentMatch =
-      history.find(
-        (match) =>
-          !match.played &&
-          (
-            match.player1Id ===
-              playerId ||
-            match.player2Id ===
-              playerId
-          ),
-      ) ?? null;
-
-    let opponent: Player | null =
-      null;
-
-    if (currentMatch) {
-      const opponentId =
-        currentMatch.player1Id ===
-        playerId
-          ? currentMatch.player2Id
-          : currentMatch.player1Id;
-
-      opponent =
-        this.getPlayer(
-          tournament,
-          opponentId,
-        ) ?? null;
-    }
-
-    const standings =
-      this.getStandings(
-        tournament,
-      );
-
-    const standing =
-      standings.find(
-        (item) =>
-          item.player.id ===
-          playerId,
-      );
-
-    return {
-      player,
-
-      phase:
-        tournament.status,
-
-      currentMatch,
-
-      opponent,
-
-      game:
-        currentMatch?.game ??
-        null,
-
+      player: this.pub(player),
+      phase: t.status,
+      currentMatch: current ? this.toSnapshotMatch(t, current) : null,
+      opponent: current ? this.pubById(t, opponentOf(current)) : null,
+      game: current?.game ?? null,
       history,
-
-      zone:
-        standing?.zone ??
-        null,
+      zone: standing?.zone ?? null,
     };
   }
 }
